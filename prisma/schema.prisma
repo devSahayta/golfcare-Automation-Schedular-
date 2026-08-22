@@ -1,0 +1,620 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model AuditLog {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  actorType   ActorType
+  actorId     String?
+  action      String
+  entityType  String
+  entityId    String
+  beforeState Json?
+  afterState  Json?
+  source      String
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@index([entityType, entityId], map: "idx_auditlog_entity")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model AvailabilityLog {
+  id                  String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  availabilityStateId String
+  previousStatus      AvailStatus?
+  newStatus           AvailStatus
+  changedBy           String
+  changedAt           DateTime          @default(now()) @db.Timestamptz(6)
+  AvailabilityState   AvailabilityState @relation(fields: [availabilityStateId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([availabilityStateId], map: "idx_availabilitylog_state")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model AvailabilityState {
+  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  productId       String?
+  variantId       String?           @unique
+  status          AvailStatus
+  source          AvailSource
+  leadTimeDays    Int?
+  confirmedBy     String?
+  confirmedAt     DateTime          @db.Timestamptz(6)
+  expiresAt       DateTime          @db.Timestamptz(6)
+  note            String?
+  AvailabilityLog AvailabilityLog[]
+  Product         Product?          @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Variant         Variant?          @relation(fields: [variantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([productId], map: "idx_availabilitystate_product")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model CampaignSend {
+  id                String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  dynamicTemplateId String
+  customerId        String
+  status            String
+  clickedAt         DateTime?       @db.Timestamptz(6)
+  convertedOrderId  String?
+  revenue           Decimal?        @db.Decimal
+  sentAt            DateTime        @db.Timestamptz(6)
+  Customer          Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  DynamicTemplate   DynamicTemplate @relation(fields: [dynamicTemplateId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([customerId], map: "idx_campaignsend_customer")
+  @@index([dynamicTemplateId], map: "idx_campaignsend_template")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model CampaignTrigger {
+  id               String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  customerId       String
+  scenario         CampaignScenario
+  sourceEventId    String?
+  detectedAt       DateTime          @default(now()) @db.Timestamptz(6)
+  status           TriggerStatus     @default(PENDING)
+  suppressedReason String?
+  Customer         Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Event            Event?            @relation(fields: [sourceEventId], references: [id], onUpdate: NoAction, map: "fk_campaigntrigger_event")
+  DynamicTemplate  DynamicTemplate[]
+
+  @@index([customerId], map: "idx_campaigntrigger_customer")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Conversation {
+  id                 String               @id @default(dbgenerated("(gen_random_uuid())::text"))
+  customerId         String?
+  supplierId         String?
+  waPhone            String
+  state              ConvState
+  assignedTo         String?
+  intent             String?
+  lastMessageAt      DateTime             @db.Timestamptz(6)
+  sessionExpiresAt   DateTime?            @db.Timestamptz(6)
+  summary            String?
+  createdAt          DateTime             @default(now()) @db.Timestamptz(6)
+  Customer           Customer?            @relation(fields: [customerId], references: [id], onUpdate: NoAction)
+  Supplier           Supplier?            @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
+  Message            Message[]
+  OnboardingResponse OnboardingResponse[]
+
+  @@index([customerId], map: "idx_conversation_customer")
+  @@index([waPhone], map: "idx_conversation_wa_phone")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Customer {
+  id                    String               @id @default(dbgenerated("(gen_random_uuid())::text"))
+  shopifyCustomerId     String?              @unique
+  waPhone               String               @unique
+  firstName             String?
+  lastName              String?
+  email                 String?
+  city                  String?
+  state                 String?
+  isMember              Boolean              @default(false)
+  memberSince           DateTime?            @db.Timestamptz(6)
+  memberCode            String?              @unique
+  tier                  Tier                 @default(STANDARD)
+  consentMarketing      Boolean              @default(false)
+  consentAt             DateTime?            @db.Timestamptz(6)
+  consentTextShown      String?
+  optedOutAt            DateTime?            @db.Timestamptz(6)
+  onboardingState       OnboardingState      @default(NOT_STARTED)
+  onboardingStartedAt   DateTime?            @db.Timestamptz(6)
+  onboardingCompletedAt DateTime?            @db.Timestamptz(6)
+  lifetimeValue         Decimal              @default(0) @db.Decimal
+  orderCount            Int                  @default(0)
+  lastOrderAt           DateTime?            @db.Timestamptz(6)
+  avgOrderValue         Decimal              @default(0) @db.Decimal
+  createdAt             DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime             @default(now()) @db.Timestamptz(6)
+  CampaignSend          CampaignSend[]
+  CampaignTrigger       CampaignTrigger[]
+  Conversation          Conversation[]
+  CustomerSegment       CustomerSegment[]
+  DynamicTemplate       DynamicTemplate[]
+  Event                 Event[]
+  GolferProfile         GolferProfile?
+  OnboardingResponse    OnboardingResponse[]
+  Order                 Order[]
+
+  @@index([waPhone], map: "idx_customer_wa_phone")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model CustomerSegment {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  customerId String
+  segmentId  String
+  addedAt    DateTime @default(now()) @db.Timestamptz(6)
+  Customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Segment    Segment  @relation(fields: [segmentId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([customerId, segmentId])
+  @@index([customerId], map: "idx_customersegment_customer")
+  @@index([segmentId], map: "idx_customersegment_segment")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model DynamicTemplate {
+  id                     String             @id @default(dbgenerated("(gen_random_uuid())::text"))
+  customerId             String
+  campaignTriggerId      String?
+  scenario               CampaignScenario
+  templateName           String             @unique
+  category               TemplateCategory
+  bodyDraft              String
+  variables              Json
+  internalApprovalStatus ApprovalStatus     @default(PENDING)
+  internalApprovedBy     String?
+  internalApprovedAt     DateTime?          @db.Timestamptz(6)
+  metaStatus             MetaTemplateStatus @default(NOT_SUBMITTED)
+  metaSubmittedAt        DateTime?          @db.Timestamptz(6)
+  metaApprovedAt         DateTime?          @db.Timestamptz(6)
+  metaRejectionReason    String?
+  sendStatus             SendStatus         @default(PENDING)
+  sentAt                 DateTime?          @db.Timestamptz(6)
+  deleteAfter            DateTime?          @db.Timestamptz(6)
+  deleteStatus           DeleteStatus       @default(NOT_DUE)
+  deletedAt              DateTime?          @db.Timestamptz(6)
+  createdAt              DateTime           @default(now()) @db.Timestamptz(6)
+  CampaignSend           CampaignSend[]
+  CampaignTrigger        CampaignTrigger?   @relation(fields: [campaignTriggerId], references: [id], onUpdate: NoAction)
+  Customer               Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([customerId], map: "idx_dynamictemplate_customer")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Event {
+  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  customerId      String?
+  type            String
+  payload         Json
+  occurredAt      DateTime          @default(now()) @db.Timestamptz(6)
+  CampaignTrigger CampaignTrigger[]
+  Customer        Customer?         @relation(fields: [customerId], references: [id], onUpdate: NoAction)
+
+  @@index([customerId, type, occurredAt], map: "idx_event_customer_type_occurred")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model GolferProfile {
+  customerId       String      @id
+  dob              DateTime?   @db.Timestamptz(6)
+  handicap         Int?
+  skillLevel       SkillLevel?
+  homeClub         String?
+  playFrequency    PlayFreq?
+  yearsPlaying     Int?
+  dominantHand     Hand?
+  gender           String?
+  addressLine1     String?
+  addressLine2     String?
+  pincode          String?
+  shaftFlex        String?
+  gloveSize        String?
+  gloveHand        String?
+  shoeSize         String?
+  apparelSize      String?
+  currentDriver    String?
+  currentIronSet   String?
+  currentBallBrand String?
+  bagType          String?
+  preferredBrands  String[]    @default([])
+  budgetTier       BudgetTier?
+  buysForOthers    Boolean?
+  corporateBuyer   Boolean?
+  anniversary      DateTime?   @db.Timestamptz(6)
+  notes            String?
+  profileScore     Int         @default(0)
+  updatedAt        DateTime    @default(now()) @db.Timestamptz(6)
+  Customer         Customer    @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Message {
+  id             String       @id @default(dbgenerated("(gen_random_uuid())::text"))
+  conversationId String
+  direction      Direction
+  sender         Sender
+  type           String
+  body           String?
+  mediaUrl       String?
+  waMessageId    String?      @unique
+  templateName   String?
+  status         String?
+  toolCalls      Json?
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+  Conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([conversationId], map: "idx_message_conversation")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model OnboardingQuestion {
+  id         String  @id @default(dbgenerated("(gen_random_uuid())::text"))
+  fieldKey   String  @unique
+  promptText String
+  isRequired Boolean @default(true)
+  order      Int
+  isActive   Boolean @default(true)
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model OnboardingResponse {
+  id             String       @id @default(dbgenerated("(gen_random_uuid())::text"))
+  customerId     String
+  conversationId String
+  fieldKey       String
+  rawAnswer      String
+  parsedValue    Json?
+  askedAt        DateTime     @db.Timestamptz(6)
+  answeredAt     DateTime?    @db.Timestamptz(6)
+  Customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_onboardingresponse_conversation")
+
+  @@index([customerId], map: "idx_onboardingresponse_customer")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Order {
+  id                String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  shopifyOrderId    String    @unique
+  customerId        String?
+  orderNumber       String
+  totalPrice        Decimal   @db.Decimal
+  currency          String    @default("INR")
+  financialStatus   String
+  fulfillmentStatus String?
+  lineItems         Json
+  discountCodes     String[]  @default([])
+  attributedTo      String?
+  placedAt          DateTime  @db.Timestamptz(6)
+  Customer          Customer? @relation(fields: [customerId], references: [id], onUpdate: NoAction)
+
+  @@index([customerId], map: "idx_order_customer")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Product {
+  id                String                 @id @default(dbgenerated("(gen_random_uuid())::text"))
+  shopifyProductId  String                 @unique
+  handle            String
+  title             String
+  vendor            String?
+  productType       String?
+  tags              String[]               @default([])
+  descriptionHtml   String?
+  imageUrls         String[]               @default([])
+  priceMin          Decimal                @db.Decimal
+  priceMax          Decimal                @db.Decimal
+  status            String
+  isConsumable      Boolean                @default(false)
+  replenishDays     Int?
+  tierLevel         BudgetTier?
+  fitAttributes     Json?
+  upsellPath        String[]               @default([])
+  embedding         Unsupported("vector")?
+  syncedAt          DateTime               @db.Timestamptz(6)
+  AvailabilityState AvailabilityState[]
+  SupplierProduct   SupplierProduct[]
+  Variant           Variant[]
+
+  @@index([embedding], map: "idx_product_embedding")
+  @@index([shopifyProductId], map: "idx_product_shopify_id")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model ProductDraft {
+  id                    String              @id @default(dbgenerated("(gen_random_uuid())::text"))
+  shopifyDraftProductId String?
+  supplierId            String?
+  sourceType            DraftSource
+  rawPayload            Json
+  approvalToken         String              @unique
+  tokenExpiresAt        DateTime            @db.Timestamptz(6)
+  approvalStatus        DraftApprovalStatus @default(PENDING)
+  approvedVia           ApprovalChannel?
+  decidedBy             String?
+  decidedAt             DateTime?           @db.Timestamptz(6)
+  emailSentTo           String?
+  emailSentAt           DateTime?           @db.Timestamptz(6)
+  createdAt             DateTime            @default(now()) @db.Timestamptz(6)
+  Supplier              Supplier?           @relation(fields: [supplierId], references: [id], onUpdate: NoAction, map: "fk_productdraft_supplier")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Segment {
+  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name            String
+  description     String?
+  rules           Json
+  isDynamic       Boolean           @default(true)
+  memberCount     Int               @default(0)
+  lastEvaluated   DateTime?         @db.Timestamptz(6)
+  CustomerSegment CustomerSegment[]
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model StaffUser {
+  id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  email     String    @unique
+  name      String
+  role      StaffRole @default(STAFF)
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Supplier {
+  id               String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name             String
+  contactName      String?
+  waPhone          String            @unique
+  email            String?
+  brands           String[]          @default([])
+  categories       String[]          @default([])
+  checkCadence     Cadence
+  checkDayOfWeek   Int?
+  checkHour        Int               @default(10)
+  isActive         Boolean           @default(true)
+  reliabilityScore Int               @default(100)
+  avgResponseMins  Int?
+  Conversation     Conversation[]
+  ProductDraft     ProductDraft[]
+  SupplierCheck    SupplierCheck[]
+  SupplierProduct  SupplierProduct[]
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model SupplierCheck {
+  id          String      @id @default(dbgenerated("(gen_random_uuid())::text"))
+  supplierId  String
+  type        CheckType
+  status      CheckStatus
+  items       Json
+  sentAt      DateTime    @db.Timestamptz(6)
+  respondedAt DateTime?   @db.Timestamptz(6)
+  rawReplies  Json
+  parsedBy    String?
+  Supplier    Supplier    @relation(fields: [supplierId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([supplierId], map: "idx_suppliercheck_supplier")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model SupplierProduct {
+  id                  String       @id @default(dbgenerated("(gen_random_uuid())::text"))
+  supplierId          String
+  productId           String
+  variantId           String?
+  supplierSku         String?
+  costPrice           Decimal?     @db.Decimal
+  leadTimeDays        Int?
+  isPrimary           Boolean      @default(false)
+  lastConfirmedStatus AvailStatus?
+  lastConfirmedAt     DateTime?    @db.Timestamptz(6)
+  Product             Product      @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Supplier            Supplier     @relation(fields: [supplierId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Variant             Variant?     @relation(fields: [variantId], references: [id], onUpdate: NoAction)
+
+  @@index([productId], map: "idx_supplierproduct_product")
+  @@index([supplierId], map: "idx_supplierproduct_supplier")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Variant {
+  id                String             @id @default(dbgenerated("(gen_random_uuid())::text"))
+  shopifyVariantId  String             @unique
+  productId         String
+  sku               String?
+  title             String
+  price             Decimal            @db.Decimal
+  compareAtPrice    Decimal?           @db.Decimal
+  optionValues      Json
+  AvailabilityState AvailabilityState?
+  SupplierProduct   SupplierProduct[]
+  Product           Product            @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([productId], map: "idx_variant_product")
+}
+
+enum ActorType {
+  STAFF
+  SUPPLIER
+  SYSTEM
+  AGENT
+}
+
+enum ApprovalChannel {
+  EMAIL
+  DASHBOARD
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum AvailSource {
+  SUPPLIER_CONFIRMED
+  MANUAL_OWNER
+  AGENT_INFERRED
+}
+
+enum AvailStatus {
+  IN_STOCK
+  OUT_OF_STOCK
+  ON_ORDER
+  DISCONTINUED
+  UNKNOWN
+}
+
+enum BudgetTier {
+  VALUE
+  MID
+  PREMIUM
+  ULTRA
+}
+
+enum Cadence {
+  DAILY
+  WEEKLY
+  ON_DEMAND
+}
+
+enum CampaignScenario {
+  BIRTHDAY
+  REPLENISHMENT
+  WINBACK
+  REVIEW_REMINDER
+  CROSS_SELL
+  CUSTOM
+}
+
+enum CheckStatus {
+  SENT
+  ANSWERED
+  TIMED_OUT
+  ESCALATED
+}
+
+enum CheckType {
+  SCHEDULED_DAILY
+  SCHEDULED_WEEKLY
+  ON_DEMAND
+}
+
+enum ConvState {
+  AI_HANDLING
+  AWAITING_HUMAN
+  HUMAN_HANDLING
+  CLOSED
+}
+
+enum DeleteStatus {
+  NOT_DUE
+  PENDING_DELETE
+  DELETED
+  DELETE_FAILED
+}
+
+enum Direction {
+  INBOUND
+  OUTBOUND
+}
+
+enum DraftApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum DraftSource {
+  SUPPLIER_PROVIDED
+  WEB_SCRAPED
+}
+
+enum Hand {
+  RIGHT
+  LEFT
+}
+
+enum MetaTemplateStatus {
+  NOT_SUBMITTED
+  SUBMITTED
+  META_APPROVED
+  META_REJECTED
+}
+
+enum OnboardingState {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum PlayFreq {
+  WEEKLY_PLUS
+  WEEKLY
+  FORTNIGHTLY
+  MONTHLY
+  OCCASIONAL
+}
+
+enum SendStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum Sender {
+  CUSTOMER
+  AI_AGENT
+  HUMAN_AGENT
+  SYSTEM
+}
+
+enum SkillLevel {
+  BEGINNER
+  IMPROVER
+  INTERMEDIATE
+  ADVANCED
+  PRO
+}
+
+enum StaffRole {
+  OWNER
+  STAFF
+  VIEWER
+}
+
+enum TemplateCategory {
+  MARKETING
+  UTILITY
+}
+
+enum Tier {
+  STANDARD
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+enum TriggerStatus {
+  PENDING
+  TEMPLATE_CREATED
+  SUPPRESSED
+  SENT
+}
