@@ -18,7 +18,7 @@ const { importAllProducts } = require("../lib/shopify");
 let isRunning = false;
 
 function registerShopifyReconciliationJob() {
-  cron.schedule("* * * * *", async () => {
+  cron.schedule("0 3 * * *", async () => {
     if (isRunning) {
       console.log(
         "[job] Shopify reconciliation already running, skipping this tick.",
