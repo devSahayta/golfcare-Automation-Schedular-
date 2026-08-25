@@ -1,3 +1,5 @@
+//src/index.js
+
 require("dotenv").config();
 const { registerAvailabilityDecayJob } = require("./jobs/availabilityDecay");
 const {
@@ -14,6 +16,10 @@ const {
   registerApprovalTokenExpirySweepJob,
 } = require("./jobs/approvalTokenExpirySweep");
 
+const {
+  registerShopifyReconciliationJob,
+} = require("./jobs/shopifyReconciliation");
+
 console.log("Golf Care OS scheduler starting...");
 
 registerAvailabilityDecayJob();
@@ -22,5 +28,8 @@ registerCampaignTriggerEvalJob();
 registerTemplateStatusPollJob();
 registerTemplateDeletionSweepJob();
 registerApprovalTokenExpirySweepJob();
+
+// add near the other register calls:
+registerShopifyReconciliationJob();
 
 console.log("Golf Care OS scheduler: all jobs registered.");

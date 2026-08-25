@@ -1,3 +1,5 @@
+//src/lib/samvaadik/adapter.js
+
 /**
  * Single interface to Samvaadik. Nothing else in the codebase should
  * call Samvaadik's HTTP API directly — always go through this file.

@@ -1,3 +1,5 @@
+//src/jobs/availabilityDecay.js
+
 const cron = require("node-cron");
 
 function registerAvailabilityDecayJob() {
