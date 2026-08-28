@@ -53,6 +53,7 @@ model AvailabilityState {
   Variant         Variant?          @relation(fields: [variantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([productId], map: "idx_availabilitystate_product")
+  @@index([expiresAt], map: "idx_availabilitystate_expires_at")
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
