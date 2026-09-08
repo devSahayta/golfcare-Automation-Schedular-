@@ -3,8 +3,18 @@
 // Module 5.1 — supplier stock check-in lifecycle. Three concerns, one
 // tick, one isRunning guard (same pattern as shopifyReconciliation.js):
 //   1. Cadence dispatch — suppliers due per their DAILY/WEEKLY schedule.
-//   2. On-demand dispatch — variants module 2's TTL sweep flagged via
-//      `availability.recheck_needed` events.
+//      Covers EVERY product the supplier owns in one message.
+//   2. On-demand digest — a once-daily, WEEKLY-suppliers-only safety net
+//      for variants that went stale (module 2's TTL sweep) before their
+//      next weekly cadence check would naturally re-ask about them. Batched
+//      into ONE message listing everything currently stale, not one
+//      message per item — an earlier version fired immediately per TTL
+//      event and spammed a supplier with a separate template per product
+//      (confirmed live: 5 back-to-back WhatsApp messages for 5 items).
+//      DAILY suppliers don't need this at all: their next cadence
+//      check-in is at most 24h away and already re-asks about everything,
+//      stale or not, so a same-day digest would just be a redundant
+//      second message — the exact problem this replaces.
 //   3. Reminders (2h) / timeouts (24h) for checks nobody's answered yet.
 //
 // WhatsApp window rule (already documented in lib/samvaadik/adapter.js):
@@ -31,6 +41,9 @@ const REMINDER_TEMPLATE_NAME =
 const REMINDER_HOURS = Number(process.env.SUPPLIER_CHECK_REMINDER_HOURS || 2);
 const TIMEOUT_HOURS = Number(process.env.SUPPLIER_CHECK_TIMEOUT_HOURS || 24);
 const STAFF_ESCALATION_WA_PHONE = process.env.STAFF_ESCALATION_WA_PHONE || "";
+// Once-a-day hour for the on-demand digest (WEEKLY suppliers only — see
+// header). Deliberately not tied to any supplier's own checkHour.
+const ON_DEMAND_DIGEST_HOUR = Number(process.env.SUPPLIER_ON_DEMAND_DIGEST_HOUR || 12);
 
 const CADENCE_HOURS = { DAILY: 24, WEEKLY: 168 };
 const CADENCE_CHECK_TYPE = { DAILY: "SCHEDULED_DAILY", WEEKLY: "SCHEDULED_WEEKLY" };
@@ -151,50 +164,46 @@ async function dispatchCadenceChecks() {
   return dispatched;
 }
 
-// Consumes module 2's `availability.recheck_needed` events (emitted by the
-// TTL decay sweep — see availabilityDecay.js) for variants with a primary
-// supplier. Dedup window matches TIMEOUT_HOURS: don't re-dispatch an
-// on-demand check for the same supplier+variant if one's already out and
-// hasn't timed out yet.
+// Once-daily, WEEKLY-suppliers-only batch (see header for why DAILY
+// suppliers are excluded entirely). Pulls directly off current
+// AvailabilityState.status rather than consuming module 2's TTL-sweep
+// events one at a time — every stale variant a supplier owns is state,
+// not a queue, so this just asks "what's stale for this supplier right
+// now" and sends ONE message for all of it, instead of firing once per
+// expiry event as the previous version did.
 async function dispatchOnDemandChecks() {
-  const since = new Date(Date.now() - 20 * 60 * 1000); // job runs every 15 min; small overlap for safety
-  const events = await prisma.event.findMany({
-    where: { type: "availability.recheck_needed", occurredAt: { gte: since } },
-    orderBy: { occurredAt: "desc" },
-    take: 50,
+  const { hour } = getLocalHourAndDay(TIMEZONE);
+  if (hour !== ON_DEMAND_DIGEST_HOUR) return 0;
+
+  const suppliers = await prisma.supplier.findMany({
+    where: { isActive: true, checkCadence: "WEEKLY" },
   });
 
   let dispatched = 0;
-  for (const event of events) {
-    const { variantId, supplierId } = event.payload || {};
-    if (!variantId || !supplierId) continue;
-
-    const supplier = await prisma.supplier.findUnique({ where: { id: supplierId } });
-    if (!supplier || !supplier.isActive) continue;
-
-    const recentCutoff = new Date(Date.now() - TIMEOUT_HOURS * 60 * 60 * 1000);
-    const recentChecks = await prisma.supplierCheck.findMany({
-      where: { supplierId, type: "ON_DEMAND", sentAt: { gte: recentCutoff } },
-      select: { items: true },
+  for (const supplier of suppliers) {
+    const dedupCutoff = new Date(Date.now() - 23 * 60 * 60 * 1000);
+    const alreadySentToday = await prisma.supplierCheck.findFirst({
+      where: { supplierId: supplier.id, type: "ON_DEMAND", sentAt: { gte: dedupCutoff } },
+      select: { id: true },
     });
-    const alreadyCovered = recentChecks.some((c) =>
-      (c.items || []).some((item) => item.variantId === variantId),
-    );
-    if (alreadyCovered) continue;
+    if (alreadySentToday) continue;
 
-    const supplierProduct = await prisma.supplierProduct.findFirst({
-      where: { supplierId, variantId },
+    const staleSupplierProducts = await prisma.supplierProduct.findMany({
+      where: {
+        supplierId: supplier.id,
+        Variant: { AvailabilityState: { status: "UNKNOWN" } },
+      },
       include: { Variant: true, Product: true },
     });
-    if (!supplierProduct) continue;
+    if (staleSupplierProducts.length === 0) continue; // nothing overdue today
 
-    const items = buildPendingItems([supplierProduct]);
+    const items = buildPendingItems(staleSupplierProducts);
 
     try {
       await sendCheckinOpener(supplier, items.length);
     } catch (err) {
       console.error(
-        `[job] supplier check dispatch: on-demand template send failed for supplier ${supplierId}:`,
+        `[job] supplier check dispatch: on-demand digest send failed for supplier ${supplier.id}:`,
         err.message,
       );
       continue;
@@ -203,7 +212,7 @@ async function dispatchOnDemandChecks() {
     const conversation = await resolveSupplierConversation(supplier);
     await prisma.supplierCheck.create({
       data: {
-        supplierId,
+        supplierId: supplier.id,
         type: "ON_DEMAND",
         status: "SENT",
         items,
