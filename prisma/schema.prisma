@@ -209,6 +209,23 @@ model Event {
   @@index([customerId, type, occurredAt], map: "idx_event_customer_type_occurred")
 }
 
+/// Duplicated from golfcare-backend's schema.prisma for the same
+/// cross-repo reason as lib/shopifyInventory.js (separate deployable,
+/// can't require() across repos). Backs shopifySyncQueueDrain.js — see
+/// that file's header for what it does.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model ShopifySyncQueue {
+  id          String       @id @default(dbgenerated("(gen_random_uuid())::text"))
+  variantId   String
+  status      AvailStatus
+  attempts    Int          @default(0)
+  lastError   String?
+  createdAt   DateTime     @default(now()) @db.Timestamptz(6)
+  processedAt DateTime?    @db.Timestamptz(6)
+
+  @@index([processedAt], map: "idx_shopifysyncqueue_processed_at")
+}
+
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model GolferProfile {
   customerId       String      @id
