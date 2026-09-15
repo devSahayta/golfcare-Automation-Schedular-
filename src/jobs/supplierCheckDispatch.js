@@ -3,7 +3,14 @@
 // Module 5.1 — supplier stock check-in lifecycle. Three concerns, one
 // tick, one isRunning guard (same pattern as shopifyReconciliation.js):
 //   1. Cadence dispatch — suppliers due per their DAILY/WEEKLY schedule.
-//      Covers EVERY product the supplier owns in one message.
+//      Covers only what's actually stale (AvailabilityState UNKNOWN, no
+//      variant link yet, or never confirmed) among what the supplier
+//      owns — not blindly everything. Originally listed every owned
+//      product regardless of freshness; confirmed live that a supplier
+//      whose whole 2,232-item catalog was already confirmed still got
+//      asked about all of it again the very next day, producing a real
+//      check-in message with nothing actually due. If nothing's stale,
+//      no message goes out at all that day.
 //   2. On-demand digest — a once-daily, WEEKLY-suppliers-only safety net
 //      for variants that went stale (module 2's TTL sweep) before their
 //      next weekly cadence check would naturally re-ask about them. Batched
@@ -12,9 +19,9 @@
 //      event and spammed a supplier with a separate template per product
 //      (confirmed live: 5 back-to-back WhatsApp messages for 5 items).
 //      DAILY suppliers don't need this at all: their next cadence
-//      check-in is at most 24h away and already re-asks about everything,
-//      stale or not, so a same-day digest would just be a redundant
-//      second message — the exact problem this replaces.
+//      check-in is at most 24h away and (now) already covers exactly what
+//      a same-day digest would — a separate digest send would just be a
+//      redundant second message, the exact problem this replaces.
 //   3. Reminders (2h) / timeouts (24h) for checks nobody's answered yet.
 //
 // WhatsApp window rule (already documented in lib/samvaadik/adapter.js):
@@ -115,11 +122,31 @@ async function dispatchCadenceChecks() {
     });
     if (alreadySent) continue;
 
+    // Only what's actually stale — a variant this supplier owns whose
+    // AvailabilityState is UNKNOWN (expired/never reconfirmed), or that
+    // has no variant link yet, or whose variant has literally never had
+    // an AvailabilityState row (brand new, never confirmed). Previously
+    // this listed EVERY product the supplier owns regardless of stock
+    // freshness, so a supplier whose whole catalog was confirmed
+    // yesterday still got asked about all of it again today — confirmed
+    // live (2,232 items, all freshly IN_STOCK with a week left on their
+    // TTL) that this fires and produces a real, confusing check-in
+    // message with nothing actually due. Matches the on-demand digest's
+    // own "only what's stale" query (supplierCheckDispatch.js's
+    // dispatchOnDemandChecks) — cadence now differs from that only in
+    // WHEN it fires (a fixed schedule) not WHAT it asks about.
     const supplierProducts = await prisma.supplierProduct.findMany({
-      where: { supplierId: supplier.id },
+      where: {
+        supplierId: supplier.id,
+        OR: [
+          { variantId: null },
+          { Variant: { AvailabilityState: { status: "UNKNOWN" } } },
+          { Variant: { AvailabilityState: null } },
+        ],
+      },
       include: { Variant: true, Product: true },
     });
-    if (supplierProducts.length === 0) continue; // nothing assigned to this supplier to check
+    if (supplierProducts.length === 0) continue; // nothing stale — nothing to ask about today
 
     const items = buildPendingItems(supplierProducts);
 
