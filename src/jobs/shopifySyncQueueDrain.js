@@ -11,28 +11,35 @@
 // the matching Shopify inventory level, gradually and rate-limit-safely,
 // from a process (this scheduler) with no request-timeout ceiling.
 //
-// isRunning guard + small batch + bounded concurrency: same reasoning as
-// shopifyReconciliation.js, just tuned for a queue that can be refilled
-// faster than it drains (bulk confirms happen in bursts) rather than a
-// single long nightly run.
+// isRunning guard + small batch, sequential and paced (not concurrent) —
+// same reasoning as shopifyReconciliation.js for the guard, but the
+// concurrency choice was wrong at first: confirmed live (in
+// golfcare-backend's confirm_all_pending_items, same underlying issue)
+// that bounded concurrency alone still hammers Shopify's real ~2
+// req/sec limit, because each variant sync is itself up to 3 sequential
+// Admin API calls (see shopifyInventory.js) — concurrency N is really up
+// to 3N requests in flight, not N. Pacing by variant with a real delay
+// between each, one at a time, stays under the limit; a 5-minute batch of
+// 100 at the default pace takes ~2.5 minutes, comfortably inside the tick
+// interval.
 
 const cron = require("node-cron");
 const { prisma } = require("../lib/prisma");
 const { writeAvailabilityToShopify } = require("../lib/shopifyInventory");
 
 const BATCH_SIZE = Number(process.env.SHOPIFY_SYNC_QUEUE_BATCH_SIZE || 100);
-const CONCURRENCY = Number(process.env.SHOPIFY_SYNC_QUEUE_CONCURRENCY || 3);
 const MAX_ATTEMPTS = Number(process.env.SHOPIFY_SYNC_QUEUE_MAX_ATTEMPTS || 5);
+// Same constant/reasoning as golfcare-backend's env.js SHOPIFY_SYNC_PACE_MS
+// — duplicated here for the same cross-repo reason as shopifyInventory.js.
+const PACE_MS = Number(process.env.SHOPIFY_SYNC_QUEUE_PACE_MS || 1500);
 
-async function mapWithConcurrency(items, limit, fn) {
-  let cursor = 0;
-  async function worker() {
-    while (cursor < items.length) {
-      const index = cursor++;
-      await fn(items[index]);
+async function mapSequentialPaced(items, delayMs, fn) {
+  for (let i = 0; i < items.length; i++) {
+    await fn(items[i]);
+    if (i < items.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
 async function drainShopifySyncQueue() {
@@ -52,7 +59,7 @@ async function drainShopifySyncQueue() {
   let processed = 0;
   let failed = 0;
 
-  await mapWithConcurrency(pending, CONCURRENCY, async (row) => {
+  await mapSequentialPaced(pending, PACE_MS, async (row) => {
     const shopifyVariantId = shopifyVariantIdByVariantId.get(row.variantId);
     if (!shopifyVariantId) {
       // Variant no longer exists (deleted since queued) — nothing to sync,
