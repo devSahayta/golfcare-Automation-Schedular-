@@ -220,17 +220,142 @@ function parseWebhook(rawBody) {
 }
 
 /**
- * BLOCKED — no matching Samvaadik endpoint.
- * Samvaadik's public API exposes GET/POST on /templates but no DELETE.
- * Flagged as an open question weeks ago — still unresolved. Needed before
- * any design that relies on self-deleting templates (e.g. a Lifecycle
- * Agent cleaning up expired campaign templates) can actually work.
+ * Delete a WhatsApp template from Meta and Samvaadik.
+ *
+ * Confirmed against Samvaadik's real source (publicApiController.js,
+ * Sept 2026) — this stub used to throw "blocked, no DELETE endpoint,"
+ * which was true when it was written but is stale now; Samvaadik added
+ * DELETE /v1/templates/:wt_id since. Samvaadik itself refuses (409,
+ * code TEMPLATE_IN_USE) if any scheduled_messages/campaigns row still
+ * references this template — callers should only reach this once the
+ * template is genuinely done being used (Module 6's
+ * templateDeletionSweep.js gates on sendStatus === "SENT" before calling
+ * this), not rely on the 409 as the only guard.
+ *
+ * @param {string} wtId - Samvaadik's whatsapp_templates.wt_id
+ * @returns {Promise<{wtId: string, name: string, metaDeleted: boolean, localRecordRetained: boolean}>}
  */
-async function deleteTemplate(templateId) {
-  throw new Error(
-    "deleteTemplate is blocked: Samvaadik's public API has no DELETE /v1/templates/:id endpoint. " +
-      "Needs to be added on Samvaadik's side before this can be implemented.",
-  );
+async function deleteTemplate(wtId) {
+  return callSamvaadik(async (client) => {
+    const res = await client.delete(`/templates/${wtId}`);
+    return {
+      wtId: res.data.data.wt_id,
+      name: res.data.data.name,
+      metaDeleted: res.data.data.meta_deleted,
+      localRecordRetained: res.data.data.local_record_retained,
+    };
+  });
+}
+
+/**
+ * Is the 24h customer-service window open for this contact?
+ *
+ * IMPORTANT — this is a FIRST-PASS check only, not the same rule
+ * sendText actually enforces. Confirmed from Samvaadik's real source:
+ * sendText's gate (check24hWindow in publicApiController.js) treats the
+ * window as CLOSED if a template was sent to this contact more recently
+ * than their last reply, even if the raw 24h hasn't elapsed
+ * (TEMPLATE_ONLY_WAITING_FOR_USER) — getSessionWindow does not
+ * replicate that rule, it only checks "was the last customer message
+ * under 24h ago." A caller that trusts this alone to decide "is
+ * freeform safe" can get session_open:true here and then have the real
+ * sendText call reject with a 403. Treat this as a cheap first pass;
+ * handle a 403 from sendText itself as the authoritative fallback
+ * signal to use a template instead.
+ *
+ * @param {string} phone - digits only
+ * @returns {Promise<{phone: string, sessionOpen: boolean, lastCustomerMessageAt: string|null, windowExpiresAt: string|null, secondsRemaining: number}>}
+ */
+async function getSessionWindow(phone) {
+  return callSamvaadik(async (client) => {
+    const res = await client.get("/messages/session-window", { params: { phone } });
+    const d = res.data.data;
+    return {
+      phone: d.phone,
+      sessionOpen: d.session_open,
+      lastCustomerMessageAt: d.last_customer_message_at,
+      windowExpiresAt: d.window_expires_at,
+      secondsRemaining: d.seconds_remaining,
+    };
+  });
+}
+
+/**
+ * Get a single template's current status by Samvaadik's own id — unlike
+ * listTemplates (APPROVED only), this returns a template in ANY status,
+ * which is the only way to poll a PENDING submission's approval state.
+ * There is no webhook for this on Samvaadik's public API — polling is
+ * the only option (confirmed from the real route file, no such webhook
+ * route exists).
+ *
+ * @param {string} wtId
+ * @returns {Promise<{wtId: string, name: string, status: string, ...}>}
+ */
+async function getTemplateStatus(wtId) {
+  return callSamvaadik(async (client) => {
+    const res = await client.get(`/templates/${wtId}`);
+    const d = res.data.data;
+    return { wtId: d.wt_id, name: d.name, status: d.status, category: d.category };
+  });
+}
+
+/**
+ * Schedule a WhatsApp template message for a future datetime — Samvaadik's
+ * own cron picks it up and sends it, no send-time precision needed on our
+ * side.
+ *
+ * NOTE ON `templateVariables`: this is a KEYED OBJECT ({"1": "Rahul", "2":
+ * "Order #123"}), NOT the positional array sendTemplate/createTemplate use
+ * — confirmed from scheduledMessageService.js. Easy to mix up with
+ * createTemplate's bodyExamples, which IS positional.
+ *
+ * @param {object} input
+ * @param {string} input.phone
+ * @param {string} [input.contactName]
+ * @param {string} input.wtId - must already be an APPROVED template (Samvaadik enforces this server-side)
+ * @param {Record<string,string>} [input.templateVariables]
+ * @param {string} [input.mediaId]
+ * @param {string} input.scheduledAt - ISO 8601, must be in the future
+ * @param {string} [input.timezone]
+ * @param {string} [input.batchId] - groups scheduled messages, filterable via listScheduledMessages
+ * @returns {Promise<object>} the full inserted scheduled_messages row, including sm_id
+ */
+async function scheduleTemplateMessage({
+  phone,
+  contactName,
+  wtId,
+  templateVariables = {},
+  mediaId,
+  scheduledAt,
+  timezone,
+  batchId,
+}) {
+  return callSamvaadik(async (client) => {
+    const res = await client.post("/messages/schedule", {
+      phone,
+      contact_name: contactName,
+      wt_id: wtId,
+      template_variables: templateVariables,
+      ...(mediaId && { media_id: mediaId }),
+      scheduled_at: scheduledAt,
+      ...(timezone && { timezone }),
+      ...(batchId && { batch_id: batchId }),
+    });
+    return res.data.data; // includes sm_id
+  });
+}
+
+/**
+ * Get a single scheduled message's current status by Samvaadik's own id.
+ *
+ * @param {string} smId
+ * @returns {Promise<object>} the scheduled_messages row (status, wa_message_id, sent_at, failed_at, error_message, ...)
+ */
+async function getScheduledMessageStatus(smId) {
+  return callSamvaadik(async (client) => {
+    const res = await client.get(`/messages/schedule/${smId}`);
+    return res.data.data;
+  });
 }
 
 /**
@@ -267,6 +392,10 @@ module.exports = {
   createTemplate,
   listTemplates,
   deleteTemplate,
+  getSessionWindow,
+  getTemplateStatus,
+  scheduleTemplateMessage,
+  getScheduledMessageStatus,
   getProduct,
   updateInventory,
   getOrderStatus,
