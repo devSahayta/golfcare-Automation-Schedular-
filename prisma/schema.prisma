@@ -208,6 +208,14 @@ model DynamicTemplate {
   draftOutputTokens      Int?               @default(0)
   draftCostUsd           Decimal?           @db.Decimal(10, 6)
   draftCostInr           Decimal?           @db.Decimal(10, 4)
+  // Real existing image (the featured product's own Shopify photo —
+  // Product.imageUrls — or a web-search fallback when that product has
+  // none locally), never an AI-generated one — same "never show a
+  // customer something unverified as fact" principle as Module 5.2's
+  // product-onboarding image handling. Uploaded to Samvaadik/Meta only
+  // at approval time (see dynamicTemplateController.js's approveTemplate
+  // in the backend repo).
+  imageUrl               String?
   CampaignSend           CampaignSend[]
   CampaignTrigger        CampaignTrigger?   @relation(fields: [campaignTriggerId], references: [id], onUpdate: NoAction)
   Customer               Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)

@@ -1,10 +1,16 @@
 // src/lib/claude/draftDynamicTemplate.js
 //
 // Module 6 — the dynamic-template lane's only Claude call. Deliberately
-// NOT a tool loop (no equivalent of golfcare-backend's toolLoop.js here)
-// — this is a one-shot, no-tools text-generation task, same spirit as
-// golfcare-backend/src/services/supplierAgent/productResearch.js's
-// isolated call but simpler still (no web_search/web_fetch).
+// NOT a client-side tool loop (no equivalent of golfcare-backend's
+// toolLoop.js here) — web_search/web_fetch are server tools Anthropic
+// executes and resolves WITHIN the one response, so no multi-turn loop
+// is needed on our side even when they're enabled (confirmed from this
+// same pattern in golfcare-backend/src/services/supplierAgent/
+// productResearch.js — every real call there finished in one iteration
+// despite being wired through a loop capable of more). Those tools are
+// only enabled when there's no local product image already on file
+// (see localImageUrl) — the common case (a real Shopify-synced photo
+// already exists) skips them entirely, no extra tokens spent.
 //
 // Pinned to Sonnet unconditionally, same reasoning as productResearch.js:
 // this runs infrequently (only when a genuine personalization scenario —
@@ -42,6 +48,23 @@ Respond with ONLY a JSON object, no other text, no markdown code fences:
 
 Keep bodyText under 300 characters, one clear idea, no more than one placeholder-driven personalization beyond the customer's name. Never invent a price, discount, or claim not given to you in the context.`;
 
+// Only used when the caller has no local product image already (see
+// draftDynamicTemplate's localImageUrl param) — asks Claude to ALSO find
+// a real image via web_search/web_fetch, same "never show a customer
+// something unverified as fact" principle as
+// golfcare-backend/src/services/supplierAgent/productResearch.js (never
+// a generated/synthetic image). Appended to the base prompt rather than
+// a separate one, so there's only one prompt to keep in sync.
+const IMAGE_SEARCH_ADDENDUM = `
+
+Also use web_search then web_fetch to find a real, direct product image URL for the product mentioned (an og:image meta tag or a product image src — never a product PAGE url, never a guessed/constructed url). Add it to the same JSON object as "imageUrl" (a string), or null if you can't confirm a real one:
+{"bodyText": "...", "variables": ["...", "..."], "category": "MARKETING" or "UTILITY", "imageUrl": "..." or null}`;
+
+const IMAGE_SEARCH_TOOLS = [
+  { type: "web_search_20250305", name: "web_search", max_uses: 3 },
+  { type: "web_fetch_20250910", name: "web_fetch", max_uses: 3 },
+];
+
 function parseDraftResponse(text) {
   const cleaned = (text || "")
     .replace(/^```(json)?\s*/i, "")
@@ -54,9 +77,10 @@ function parseDraftResponse(text) {
       bodyText: parsed.bodyText || null,
       variables: Array.isArray(parsed.variables) ? parsed.variables.map(String) : [],
       category,
+      imageUrl: parsed.imageUrl || null,
     };
   } catch {
-    return { bodyText: null, variables: [], category: "MARKETING" };
+    return { bodyText: null, variables: [], category: "MARKETING", imageUrl: null };
   }
 }
 
@@ -73,14 +97,20 @@ function computeCost(usage) {
  * @param {string} input.customerFirstName
  * @param {string} [input.productTitle] - the product being upsold
  * @param {string} [input.productUpsellContext] - why this product fits (e.g. the purchased product it follows)
- * @returns {Promise<{bodyText: string|null, variables: string[], category: "MARKETING"|"UTILITY", usage: {inputTokens: number, outputTokens: number}, cost: {usd: number, inr: number}}>}
+ * @param {string} [input.localImageUrl] - a real image already on file (Product.imageUrls) for the
+ *   featured product — when given, skips the web_search fallback entirely (no extra tokens/cost) and
+ *   is returned as-is in imageUrl.
+ * @returns {Promise<{bodyText: string|null, variables: string[], category: "MARKETING"|"UTILITY", imageUrl: string|null, usage: {inputTokens: number, outputTokens: number}, cost: {usd: number, inr: number}}>}
  */
 async function draftDynamicTemplate({
   scenario,
   customerFirstName,
   productTitle,
   productUpsellContext,
+  localImageUrl,
 }) {
+  const needsImageSearch = !localImageUrl && Boolean(productTitle);
+
   const userMessage = [
     `Scenario: ${scenario}`,
     `Customer first name: ${customerFirstName}`,
@@ -93,7 +123,8 @@ async function draftDynamicTemplate({
   const response = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 512,
-    system: SYSTEM_PROMPT,
+    system: needsImageSearch ? `${SYSTEM_PROMPT}${IMAGE_SEARCH_ADDENDUM}` : SYSTEM_PROMPT,
+    ...(needsImageSearch && { tools: IMAGE_SEARCH_TOOLS }),
     messages: [{ role: "user", content: userMessage }],
   });
 
@@ -108,7 +139,12 @@ async function draftDynamicTemplate({
     outputTokens: response.usage?.output_tokens || 0,
   };
 
-  return { ...parsed, usage, cost: computeCost(usage) };
+  return {
+    ...parsed,
+    imageUrl: localImageUrl || parsed.imageUrl,
+    usage,
+    cost: computeCost(usage),
+  };
 }
 
 module.exports = { draftDynamicTemplate };

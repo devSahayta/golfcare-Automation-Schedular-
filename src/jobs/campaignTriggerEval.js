@@ -284,7 +284,7 @@ async function evaluateCrossSell() {
   const byShopifyId = new Map(upsellProducts.map((p) => [p.shopifyProductId, p]));
 
   const targetProducts = await prisma.product.findMany({
-    select: { id: true, title: true },
+    select: { id: true, title: true, imageUrls: true },
   });
   const byId = new Map(targetProducts.map((p) => [p.id, p]));
 
@@ -321,6 +321,10 @@ async function evaluateCrossSell() {
           customerFirstName: firstName,
           productTitle: targetProduct.title,
           productUpsellContext: `Customer bought "${purchasedProduct.title}" ${CROSS_SELL_DELAY_DAYS} days ago — this pairs well with it.`,
+          // Real Shopify-synced photo for the featured product — skips
+          // draftDynamicTemplate's web_search fallback entirely when
+          // present, which it always should be for a real catalog item.
+          localImageUrl: targetProduct.imageUrls?.[0] || null,
         });
 
         if (!draft.bodyText || draft.variables.length === 0) {
@@ -344,6 +348,7 @@ async function evaluateCrossSell() {
             category: draft.category,
             bodyDraft: draft.bodyText,
             variables: draft.variables,
+            imageUrl: draft.imageUrl,
             approvalToken,
             tokenExpiresAt,
             draftInputTokens: draft.usage.inputTokens,
@@ -359,6 +364,7 @@ async function evaluateCrossSell() {
           bodyText: draft.bodyText,
           variables: draft.variables,
           category: draft.category,
+          imageUrl: draft.imageUrl,
           customerName: `${customer.firstName || ""} ${customer.lastName || ""}`.trim() || customer.waPhone,
         });
         await prisma.dynamicTemplate.update({

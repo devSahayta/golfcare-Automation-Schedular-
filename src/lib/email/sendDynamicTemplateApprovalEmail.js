@@ -35,6 +35,7 @@ function escapeHtml(str) {
  * @param {string} input.bodyText
  * @param {string[]} input.variables
  * @param {string} input.category
+ * @param {string} [input.imageUrl] - real existing product photo, never AI-generated
  * @param {string} input.customerName
  */
 async function sendDynamicTemplateApprovalEmail({
@@ -43,6 +44,7 @@ async function sendDynamicTemplateApprovalEmail({
   bodyText,
   variables,
   category,
+  imageUrl,
   customerName,
 }) {
   const staffApprovalEmail = process.env.STAFF_APPROVAL_EMAIL;
@@ -61,6 +63,7 @@ async function sendDynamicTemplateApprovalEmail({
     <div style="font-family: sans-serif; max-width: 480px;">
       <h2>New campaign template pending approval</h2>
       <p><strong>${escapeHtml(scenario)}</strong> for ${escapeHtml(customerName)} &middot; ${escapeHtml(category)}</p>
+      ${imageUrl ? `<img src="${escapeHtml(imageUrl)}" alt="" style="max-width:100%;border-radius:8px;" />` : ""}
       <p>${escapeHtml(previewText)}</p>
       <p style="color:#666;font-size:13px;">AI-drafted for this one customer, will be submitted to Meta for approval, sent once, then deleted — not a reusable template.</p>
       <p>
