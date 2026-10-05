@@ -102,6 +102,7 @@ model Conversation {
   sessionExpiresAt   DateTime?            @db.Timestamptz(6)
   summary            String?
   createdAt          DateTime             @default(now()) @db.Timestamptz(6)
+  processingLockedAt DateTime?            @db.Timestamptz(6)
   Customer           Customer?            @relation(fields: [customerId], references: [id], onUpdate: NoAction)
   Supplier           Supplier?            @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
   Message            Message[]
