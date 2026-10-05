@@ -12,10 +12,12 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.122.0",
     "@prisma/client": "^5.19.0",
     "axios": "^1.19.0",
     "dotenv": "^17.4.2",
     "node-cron": "^4.6.0",
-    "prisma": "^5.19.0"
+    "prisma": "^5.19.0",
+    "resend": "^6.25.0"
   }
 }

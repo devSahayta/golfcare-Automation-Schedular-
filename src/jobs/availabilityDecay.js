@@ -11,10 +11,10 @@
 // AGENT_INFERRED — the status is no longer supplier/staff-confirmed, it's
 // the system inferring that the prior confirmation has gone stale.
 //
-// Also emits a distinct `availability.recheck_needed` event per expired
-// variant (with its primary supplier, if any) so module 5's dispatch job
-// can queue a re-check once it exists — setAvailability() itself only
-// emits `availability.changed`.
+// Module 5's on-demand digest (supplierCheckDispatch.js) reads
+// AvailabilityState.status === "UNKNOWN" directly rather than consuming a
+// per-expiry event queue, so flipping the status here is itself the
+// signal — no separate event needs emitting for that job to pick it up.
 
 const cron = require("node-cron");
 const { prisma } = require("../lib/prisma");
@@ -40,23 +40,6 @@ async function sweepExpiredAvailability() {
         source: "AGENT_INFERRED",
         changedBy: "system:ttl-sweep",
         note: "Confirmation expired (TTL sweep)",
-      });
-
-      const primarySupplier = await prisma.supplierProduct.findFirst({
-        where: { variantId: state.variantId, isPrimary: true },
-        select: { supplierId: true },
-      });
-
-      await prisma.event.create({
-        data: {
-          type: "availability.recheck_needed",
-          payload: {
-            variantId: state.variantId,
-            productId: state.productId,
-            previousStatus: state.status,
-            supplierId: primarySupplier?.supplierId || null,
-          },
-        },
       });
 
       flipped += 1;
