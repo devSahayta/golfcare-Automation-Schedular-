@@ -142,6 +142,7 @@ async function draftDynamicTemplate({
   return {
     ...parsed,
     imageUrl: localImageUrl || parsed.imageUrl,
+    model: MODEL,
     usage,
     cost: computeCost(usage),
   };

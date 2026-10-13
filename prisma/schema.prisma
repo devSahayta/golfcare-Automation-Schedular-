@@ -107,9 +107,36 @@ model Conversation {
   Supplier           Supplier?            @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
   Message            Message[]
   OnboardingResponse OnboardingResponse[]
+  AgentUsage         AgentUsage[]
 
   @@index([customerId], map: "idx_conversation_customer")
   @@index([waPhone], map: "idx_conversation_wa_phone")
+}
+
+// Added for Module 6 — the Lifecycle Agent's drafting calls need the same
+// AgentUsage logging every other agent already has. This table exists in
+// the shared DB already (populated by the backend's agentEngine/logger.js
+// for other agents) — this model just gives the scheduler's own Prisma
+// client visibility into it, kept in sync with the backend's copy per
+// this repo's cross-repo duplication convention.
+model AgentUsage {
+  id             String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  conversationId String
+  agentName      String   @default("unknown")
+  inputTokens    Int      @default(0)
+  outputTokens   Int      @default(0)
+  costUsd        Decimal  @default(0) @db.Decimal(10, 6)
+  costInr        Decimal  @default(0) @db.Decimal(10, 4)
+  toolCallCount  Int      @default(0)
+  outcome        String
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  model          String?
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+
+  @@index([conversationId])
+  @@index([createdAt])
+  @@index([agentName])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.

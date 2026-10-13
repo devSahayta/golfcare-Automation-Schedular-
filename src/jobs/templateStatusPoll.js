@@ -107,18 +107,30 @@ async function pollMetaApprovals() {
       });
 
       try {
+        const sendTime = computeSendTime();
+        const batchId = batchIdFor(template.scenario);
         const result = await scheduleTemplateMessage({
           phone: template.Customer.waPhone,
           contactName: `${template.Customer.firstName || ""} ${template.Customer.lastName || ""}`.trim() || undefined,
           wtId: template.samvaadikWtId,
           templateVariables,
-          scheduledAt: computeSendTime().toISOString(),
+          scheduledAt: sendTime.toISOString(),
           timezone: TIMEZONE,
-          batchId: batchIdFor(template.scenario),
+          batchId,
         });
         await prisma.dynamicTemplate.update({
           where: { id: template.id },
-          data: { samvaadikSmId: result.sm_id, batchId: batchIdFor(template.scenario) },
+          data: { samvaadikSmId: result.sm_id, batchId },
+        });
+        await prisma.auditLog.create({
+          data: {
+            actorType: "AGENT",
+            action: "campaign_template_scheduled",
+            entityType: "DynamicTemplate",
+            entityId: template.id,
+            afterState: { samvaadikSmId: result.sm_id, scheduledAt: sendTime.toISOString() },
+            source: "template_status_poll",
+          },
         });
         scheduled += 1;
       } catch (err) {
@@ -135,6 +147,16 @@ async function pollMetaApprovals() {
           data: { status: "SUPPRESSED", suppressedReason: "meta_rejected" },
         });
       }
+      await prisma.auditLog.create({
+        data: {
+          actorType: "AGENT",
+          action: "campaign_template_meta_rejected",
+          entityType: "DynamicTemplate",
+          entityId: template.id,
+          afterState: { reason: "Rejected by Meta" },
+          source: "template_status_poll",
+        },
+      });
     }
     // Anything still PENDING on Meta's side is left alone — next tick checks again.
   }
@@ -203,6 +225,17 @@ async function pollSendStatus() {
         console.error(`[job] templateStatusPoll: Message/Conversation log failed for ${template.id}:`, err.message);
       }
 
+      await prisma.auditLog.create({
+        data: {
+          actorType: "AGENT",
+          action: "campaign_template_sent",
+          entityType: "DynamicTemplate",
+          entityId: template.id,
+          afterState: { sentAt: sentAt.toISOString() },
+          source: "template_status_poll",
+        },
+      });
+
       sent += 1;
     } else if (status.status === "failed") {
       await prisma.dynamicTemplate.update({ where: { id: template.id }, data: { sendStatus: "FAILED" } });
@@ -212,6 +245,16 @@ async function pollSendStatus() {
           data: { status: "SUPPRESSED", suppressedReason: `send_failed: ${status.error_message || "unknown"}`.slice(0, 250) },
         });
       }
+      await prisma.auditLog.create({
+        data: {
+          actorType: "AGENT",
+          action: "campaign_template_send_failed",
+          entityType: "DynamicTemplate",
+          entityId: template.id,
+          afterState: { error: status.error_message || "unknown" },
+          source: "template_status_poll",
+        },
+      });
     }
   }
 

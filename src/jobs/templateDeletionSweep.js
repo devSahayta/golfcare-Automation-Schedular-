@@ -33,6 +33,16 @@ async function sweepDueTemplates() {
         where: { id: template.id },
         data: { deleteStatus: "DELETED", deletedAt: new Date() },
       });
+      await prisma.auditLog.create({
+        data: {
+          actorType: "AGENT",
+          action: "campaign_template_deleted",
+          entityType: "DynamicTemplate",
+          entityId: template.id,
+          afterState: { samvaadikWtId: template.samvaadikWtId },
+          source: "template_deletion_sweep",
+        },
+      });
       deleted += 1;
     } catch (err) {
       console.error(`[job] templateDeletionSweep: delete failed for ${template.id}:`, err.message);
