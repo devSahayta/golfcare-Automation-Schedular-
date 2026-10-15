@@ -182,4 +182,82 @@ async function importAllProducts() {
   return { totalImported, pages };
 }
 
-module.exports = { importAllProducts, getValidAccessToken };
+// Mirrors golfcare-backend's services/shopifyProductCreate.js createDraftProduct
+// — used by jobs/productImportDrain.js to create a real (unpublished)
+// Shopify draft product per genuinely-new bulk-import item. Deliberately
+// doesn't include the backend's publishProduct/publishToAllChannels —
+// those only matter at human-approval time, which still happens through
+// the existing backend productDraftController.js flow; this job only
+// ever creates drafts, never approves/publishes one.
+async function createDraftProduct({
+  title,
+  price,
+  category,
+  specs,
+  brand,
+  sku,
+  variantOptions,
+  imageUrl,
+  quantity,
+}) {
+  const accessToken = await getValidAccessToken();
+  const client = axios.create({
+    baseURL: `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
+    headers: {
+      "X-Shopify-Access-Token": accessToken,
+      "Content-Type": "application/json",
+    },
+    timeout: 20000,
+  });
+
+  const options = Array.isArray(variantOptions) ? variantOptions.slice(0, 3) : [];
+  const variant = { price: String(price) };
+  if (sku) variant.sku = sku;
+  if (quantity != null) {
+    variant.inventory_management = "shopify";
+    variant.inventory_quantity = quantity;
+  }
+  options.forEach((opt, i) => {
+    variant[`option${i + 1}`] = opt.value;
+  });
+
+  const buildPayload = (withImage) => ({
+    product: {
+      title,
+      body_html: specs || undefined,
+      product_type: category || undefined,
+      vendor: brand || undefined,
+      status: "draft",
+      ...(options.length ? { options: options.map((o) => ({ name: o.name })) } : {}),
+      variants: [variant],
+      ...(withImage && imageUrl ? { images: [{ src: imageUrl }] } : {}),
+    },
+  });
+
+  let product;
+  try {
+    const res = await client.post("/products.json", buildPayload(true));
+    product = res.data.product;
+  } catch (err) {
+    if (!imageUrl) throw err;
+    // Same recoverable-failure reasoning as the backend version — a dead
+    // image src shouldn't lose the whole draft.
+    console.error(
+      "[shopify] createDraftProduct with image failed, retrying without image:",
+      err.response?.data || err.message,
+    );
+    const res = await client.post("/products.json", buildPayload(false));
+    product = res.data.product;
+  }
+
+  const imageIncluded = Boolean(product.images && product.images.length > 0);
+
+  return {
+    shopifyProductId: String(product.id),
+    shopifyVariantId: String(product.variants[0].id),
+    handle: product.handle,
+    imageIncluded,
+  };
+}
+
+module.exports = { importAllProducts, getValidAccessToken, createDraftProduct };

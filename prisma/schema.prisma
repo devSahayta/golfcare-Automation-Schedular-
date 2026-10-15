@@ -472,6 +472,70 @@ model Supplier {
   ProductDraft     ProductDraft[]
   SupplierCheck    SupplierCheck[]
   SupplierProduct  SupplierProduct[]
+  ProductImportBatch ProductImportBatch[]
+}
+
+enum ImportBatchStatus {
+  PENDING_EXTRACTION
+  PROCESSING
+  DONE
+}
+
+enum ImportItemStatus {
+  PENDING
+  RESEARCHING
+  DRAFTED
+  LINKED_EXISTING
+  FAILED
+}
+
+// A supplier sending a large catalog/price list (many new products at
+// once) can't be processed inline during the backend chat turn — see
+// golfcare-Automation-Backend-'s start_bulk_product_import tool, which
+// writes these rows, and jobs/productImportDrain.js below, which drains
+// them gradually (duplicate-check, research, real Shopify draft
+// creation) with no request-timeout risk since this runs as a Render
+// background worker, not a Vercel function.
+model ProductImportBatch {
+  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  supplierId      String
+  conversationId  String?
+  totalItems      Int               @default(0)
+  processedItems  Int               @default(0)
+  draftedCount    Int               @default(0)
+  linkedCount     Int               @default(0)
+  failedCount     Int               @default(0)
+  status          ImportBatchStatus @default(PENDING_EXTRACTION)
+  rawDocumentText String?
+  marginPercent   Decimal?
+  gstPercent      Decimal?
+  extractionError String?
+  createdAt       DateTime          @default(now())
+  completedAt     DateTime?
+  Supplier        Supplier          @relation(fields: [supplierId], references: [id])
+  Items           ProductImportItem[]
+}
+
+model ProductImportItem {
+  id                     String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  batchId                String
+  title                  String
+  sku                    String?
+  brand                  String?
+  mrp                    Decimal
+  marginPercent          Decimal
+  gstPercent             Decimal
+  variantOptions         Json?
+  status                 ImportItemStatus  @default(PENDING)
+  resultProductDraftId   String?
+  resultMatchedProductId String?
+  errorMessage           String?
+  createdAt              DateTime          @default(now())
+  processedAt            DateTime?
+  Batch                  ProductImportBatch @relation(fields: [batchId], references: [id])
+
+  @@index([status])
+  @@index([batchId])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.

@@ -144,4 +144,33 @@ async function writeAvailabilityToShopify(
   };
 }
 
-module.exports = { writeAvailabilityToShopify };
+// Mirrors golfcare-backend's services/shopifyInventory.js updateInventoryItemCost
+// — used by jobs/productImportDrain.js after creating a bulk-import draft
+// product, same as the backend's create_product_draft tool does inline.
+// Shopify's InventoryItem.cost is a real, separate field from the
+// customer-facing variant price — this is what powers Shopify's own
+// profit/margin reporting.
+async function updateInventoryItemCost(shopifyVariantId, cost, { attempts = 2, retryDelayMs = 500 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const inventoryItemId = await getInventoryItemId(shopifyVariantId);
+      const client = await shopifyClient();
+      await client.put(`/inventory_items/${inventoryItemId}.json`, {
+        inventory_item: { id: inventoryItemId, cost: String(cost) },
+      });
+      return { ok: true };
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) {
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+      }
+    }
+  }
+  return {
+    ok: false,
+    error: lastError?.response?.data || lastError?.message || String(lastError),
+  };
+}
+
+module.exports = { writeAvailabilityToShopify, updateInventoryItemCost };
