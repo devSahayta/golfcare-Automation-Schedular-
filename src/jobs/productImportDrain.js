@@ -42,6 +42,45 @@ const TOKEN_EXPIRY_DAYS = Number(process.env.PRODUCT_DRAFT_TOKEN_EXPIRY_DAYS || 
 // real business limit.
 const MAX_ITEMS_PER_BATCH = Number(process.env.BULK_PRODUCT_IMPORT_MAX_ITEMS || 1000);
 
+function normalizeRateKey(s) {
+  return (s || "").toLowerCase().trim();
+}
+
+// true if ruleVal doesn't filter on this dimension, or if it fuzzily
+// matches itemVal. False (never a match) when the rule DOES filter on
+// this dimension but the item's own value is unknown (null) — a rule
+// should never apply to something it can't actually confirm.
+function fuzzyFieldMatch(ruleVal, itemVal) {
+  if (!ruleVal) return true;
+  if (!itemVal) return false;
+  const a = normalizeRateKey(ruleVal);
+  const b = normalizeRateKey(itemVal);
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+// Resolves one extracted item's margin/GST against the batch's rateRules
+// — the supplier's actual given rates, never a guess (see
+// start_bulk_product_import's tool description, backend repo). Picks the
+// MOST SPECIFIC matching rule (brand+category beats either alone beats
+// a bare default with neither set); returns null if nothing matches, in
+// which case the caller marks the item NEEDS_RATE instead of drafting it
+// with an invented number.
+function resolveRate(rateRules, item) {
+  const rules = Array.isArray(rateRules) ? rateRules : [];
+  let best = null;
+  let bestSpecificity = -1;
+  for (const rule of rules) {
+    if (!fuzzyFieldMatch(rule.brand, item.brand)) continue;
+    if (!fuzzyFieldMatch(rule.category, item.category)) continue;
+    const specificity = (rule.brand ? 1 : 0) + (rule.category ? 1 : 0);
+    if (specificity > bestSpecificity) {
+      best = rule;
+      bestSpecificity = specificity;
+    }
+  }
+  return best ? { marginPercent: best.marginPercent, gstPercent: best.gstPercent } : null;
+}
+
 // Parses one PENDING_EXTRACTION batch's raw document text into real
 // ProductImportItem rows, then flips it to PROCESSING so the normal
 // draining loop below picks it up exactly like any other batch. One
@@ -80,15 +119,37 @@ async function extractPendingBatch() {
       }
     }
 
-    const cleanItems = items.slice(0, MAX_ITEMS_PER_BATCH).map((i) => ({
-      batchId: batch.id,
-      title: i.title,
-      sku: i.sku || null,
-      brand: i.brand || null,
-      mrp: i.mrp,
-      marginPercent: batch.marginPercent,
-      gstPercent: batch.gstPercent,
-    }));
+    // Each extracted entry is one PRODUCT (possibly several real variants —
+    // see extractBulkCatalogItems.js) — stored as one ProductImportItem row
+    // with the full variant list in variantOptions, not one row per SKU.
+    // Top-level sku/mrp mirror the first variant for simple display. Each
+    // item's margin/GST are resolved against the batch's rateRules here,
+    // once — nothing downstream (processItem, etc.) needs to know rates
+    // ever varied by brand/category, it just reads the already-resolved
+    // value off the row.
+    const cleanItems = items
+      .filter((i) => Array.isArray(i.variants) && i.variants.length > 0)
+      .slice(0, MAX_ITEMS_PER_BATCH)
+      .map((i) => {
+        const rate = resolveRate(batch.rateRules, i);
+        return {
+          batchId: batch.id,
+          title: i.title,
+          sku: i.variants[0].sku || null,
+          brand: i.brand || null,
+          category: i.category || null,
+          mrp: i.variants[0].mrp,
+          marginPercent: rate?.marginPercent ?? null,
+          gstPercent: rate?.gstPercent ?? null,
+          variantOptionName: i.variantOptionName || null,
+          variantOptions: i.variants,
+          status: rate ? "PENDING" : "NEEDS_RATE",
+          // NEEDS_RATE items are already "done" from the drain loop's
+          // perspective (it only ever queries PENDING) — processedAt now
+          // marks that explicitly rather than leaving it looking stuck.
+          processedAt: rate ? null : new Date(),
+        };
+      });
 
     if (cleanItems.length === 0) {
       await prisma.productImportBatch.update({
@@ -98,12 +159,22 @@ async function extractPendingBatch() {
       return { batchId: batch.id, extracted: 0 };
     }
 
+    const needsRateCount = cleanItems.filter((i) => i.status === "NEEDS_RATE").length;
     await prisma.productImportItem.createMany({ data: cleanItems });
     await prisma.productImportBatch.update({
       where: { id: batch.id },
-      data: { totalItems: cleanItems.length, status: "PROCESSING" },
+      data: {
+        totalItems: cleanItems.length,
+        processedItems: needsRateCount,
+        needsRateCount,
+        status: "PROCESSING",
+      },
     });
-    return { batchId: batch.id, extracted: cleanItems.length };
+    // No-ops unless EVERY item came back NEEDS_RATE (nothing PENDING for
+    // the normal drain loop to ever reach this batch through) — see
+    // finalizeBatchIfComplete's own comment.
+    await finalizeBatchIfComplete(batch.id);
+    return { batchId: batch.id, extracted: cleanItems.length, needsRate: needsRateCount };
   } catch (err) {
     console.error(`[job] productImportDrain: extraction failed for batch ${batch.id}:`, err.message);
     await prisma.productImportBatch.update({
@@ -129,12 +200,33 @@ async function mapSequentialPaced(items, delayMs, fn) {
 // existing product or research + create a real Shopify draft.
 async function processItem(item, batch) {
   try {
-    const variantOptions = Array.isArray(item.variantOptions) ? item.variantOptions : [];
-    const catalogMatch = await findExistingCatalogMatch({
-      title: item.title,
-      sku: item.sku,
-      variantOptions,
-    });
+    // item.variantOptions holds the real variant list (one entry per
+    // Shopify variant this product should have) — see
+    // extractBulkCatalogItems.js. Falls back to a single implied variant
+    // (the item's own top-level sku/mrp) for a row that somehow has none,
+    // which shouldn't happen from the extractor but keeps this function
+    // from crashing if it ever does.
+    const variants = Array.isArray(item.variantOptions) && item.variantOptions.length > 0
+      ? item.variantOptions
+      : [{ value: null, sku: item.sku, mrp: Number(item.mrp) }];
+
+    // Duplicate-check against the whole catalog, one probe per variant —
+    // if ANY variant matches something that already exists, the simplest
+    // safe call is to treat the WHOLE product as already-existing rather
+    // than trying to split it into "these 2 variants are new, these 2
+    // aren't" (that would mean adding variants to an existing live
+    // Shopify product, a riskier operation this doesn't attempt). Known
+    // simplification — rare in practice (a supplier catalog's items are
+    // either all-new or all-already-stocked almost always).
+    let catalogMatch = null;
+    for (const v of variants) {
+      catalogMatch = await findExistingCatalogMatch({
+        title: item.title,
+        sku: v.sku,
+        variantOptions: item.variantOptionName && v.value ? [{ name: item.variantOptionName, value: v.value }] : [],
+      });
+      if (catalogMatch?.variant) break;
+    }
 
     if (catalogMatch?.variant) {
       let supplierProduct = await prisma.supplierProduct.findFirst({
@@ -206,26 +298,35 @@ async function processItem(item, batch) {
 
     const shopifyResult = await createDraftProduct({
       title: item.title,
-      price: Number(item.mrp),
       specs: research.specs,
       brand: item.brand || undefined,
-      sku: item.sku || undefined,
-      variantOptions,
+      variantOptionName: item.variantOptionName || null,
+      variants,
       imageUrl: research.imageUrl,
     });
 
-    const costPrice = computeCostPrice({
-      mrp: Number(item.mrp),
-      marginPercent: Number(item.marginPercent),
-      gstPercent: Number(item.gstPercent),
-    });
-    const costResult = await updateInventoryItemCost(shopifyResult.shopifyVariantId, costPrice);
-    if (!costResult.ok) {
-      console.error(
-        `[job] productImportDrain: Shopify cost sync failed for ${shopifyResult.shopifyProductId}:`,
-        costResult.error,
-      );
-    }
+    // One cost-price sync per real Shopify variant — margin/GST are the
+    // batch's blanket rate, but each variant can have its own MRP (rare
+    // in practice for this catalog shape, but the document sometimes does
+    // vary price by size), so cost price is computed per variant, not once
+    // for the whole product.
+    const variantCostResults = await Promise.all(
+      shopifyResult.variantResults.map(async (vr) => {
+        const costPrice = computeCostPrice({
+          mrp: vr.mrp,
+          marginPercent: Number(item.marginPercent),
+          gstPercent: Number(item.gstPercent),
+        });
+        const costResult = await updateInventoryItemCost(vr.shopifyVariantId, costPrice);
+        if (!costResult.ok) {
+          console.error(
+            `[job] productImportDrain: Shopify cost sync failed for variant ${vr.shopifyVariantId} on ${shopifyResult.shopifyProductId}:`,
+            costResult.error,
+          );
+        }
+        return { shopifyVariantId: vr.shopifyVariantId, mrp: vr.mrp, costPrice };
+      }),
+    );
 
     const approvalToken = crypto.randomBytes(24).toString("hex");
     const tokenExpiresAt = new Date(Date.now() + TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
@@ -237,14 +338,33 @@ async function processItem(item, batch) {
         sourceType: research.specs || research.imageUrl ? "WEB_SCRAPED" : "SUPPLIER_PROVIDED",
         rawPayload: {
           title: item.title,
-          price: Number(item.mrp),
           brand: item.brand || null,
-          sku: item.sku || null,
-          variantOptions,
-          mrp: Number(item.mrp),
+          variantOptionName: item.variantOptionName || null,
+          variants: variantCostResults.map((vr, i) => ({
+            value: variants[i]?.value || null,
+            sku: variants[i]?.sku || null,
+            mrp: vr.mrp,
+            costPrice: vr.costPrice,
+          })),
+          // Mirrors of the first/primary variant, in the exact field
+          // names backend's productDraftController.js (the shared
+          // approval page, not touched by this change) already reads —
+          // so that page keeps rendering sensibly for a multi-variant
+          // draft without needing its own rewrite. variantOptions here is
+          // display-only, a hint that more variants exist; it doesn't
+          // drive creation (variants above already did that).
+          price: variants[0]?.mrp,
+          sku: variants[0]?.sku || null,
+          costPrice: variantCostResults[0]?.costPrice ?? null,
+          variantOptions:
+            item.variantOptionName && variants[0]?.value
+              ? [{
+                  name: item.variantOptionName,
+                  value: variants.length > 1 ? `${variants[0].value} (+${variants.length - 1} more variant${variants.length > 2 ? "s" : ""})` : variants[0].value,
+                }]
+              : [],
           marginPercent: Number(item.marginPercent),
           gstPercent: Number(item.gstPercent),
-          costPrice,
           specs: research.specs,
           imageUrl: research.imageUrl,
           sourceNotes: research.sourceNotes || "Bulk catalog import — no per-item supplier Q&A, margin/GST are the batch's blanket rate.",
@@ -267,6 +387,60 @@ async function processItem(item, batch) {
       data: { status: "FAILED", errorMessage: String(err.message).slice(0, 500), processedAt: new Date() },
     });
     return { kind: "failed" };
+  }
+}
+
+// Flips a batch to DONE and sends the one digest email once every item
+// is accounted for (drafted/linked/failed, OR already pre-counted as
+// NEEDS_RATE at extraction time — see extractPendingBatch). Shared by the
+// normal per-tick drain loop AND extraction itself, because a batch where
+// EVERY item comes back NEEDS_RATE never has anything PENDING for the
+// drain loop to ever touch — without this being called from extraction
+// too, such a batch would sit at PROCESSING forever with no completion
+// email, leaving staff with no signal that it's stuck needing rate info.
+async function finalizeBatchIfComplete(batchId) {
+  const batch = await prisma.productImportBatch.findUnique({ where: { id: batchId } });
+  if (!batch || batch.status !== "PROCESSING") return;
+  if (batch.processedItems < batch.totalItems) return;
+
+  const updated = await prisma.productImportBatch.update({
+    where: { id: batchId },
+    data: { status: "DONE", completedAt: new Date() },
+  });
+
+  // Re-fetch every drafted item across the WHOLE batch (not just the
+  // triggering tick's slice) for the digest — earlier ticks' drafts need
+  // to be in the same email too.
+  const allDrafted = await prisma.productImportItem.findMany({
+    where: { batchId, status: "DRAFTED", resultProductDraftId: { not: null } },
+    select: { title: true, resultProductDraftId: true },
+  });
+  const drafts = await prisma.productDraft.findMany({
+    where: { id: { in: allDrafted.map((d) => d.resultProductDraftId) } },
+    select: { id: true, approvalToken: true },
+  });
+  const tokenByDraftId = new Map(drafts.map((d) => [d.id, d.approvalToken]));
+  const draftedItems = allDrafted
+    .map((d) => ({ title: d.title, token: tokenByDraftId.get(d.resultProductDraftId) }))
+    .filter((d) => d.token);
+
+  const needsRateItems = await prisma.productImportItem.findMany({
+    where: { batchId, status: "NEEDS_RATE" },
+    select: { title: true, brand: true, category: true },
+  });
+
+  const supplier = await prisma.supplier.findUnique({ where: { id: updated.supplierId } });
+  try {
+    await sendBulkImportDigestEmail({
+      supplierName: supplier?.name || "Unknown supplier",
+      totalItems: updated.totalItems,
+      draftedItems,
+      linkedCount: updated.linkedCount,
+      failedCount: updated.failedCount,
+      needsRateItems,
+    });
+  } catch (err) {
+    console.error(`[job] productImportDrain: digest email failed for batch ${batchId}:`, err.message);
   }
 }
 
@@ -299,7 +473,7 @@ async function drainProductImportQueue() {
 
   for (const [batchId, tally] of perBatchTally) {
     const processedThisTick = pending.filter((p) => p.batchId === batchId).length;
-    const updated = await prisma.productImportBatch.update({
+    await prisma.productImportBatch.update({
       where: { id: batchId },
       data: {
         processedItems: { increment: processedThisTick },
@@ -308,42 +482,7 @@ async function drainProductImportQueue() {
         failedCount: { increment: tally.failed },
       },
     });
-
-    if (updated.status === "PROCESSING" && updated.processedItems >= updated.totalItems) {
-      await prisma.productImportBatch.update({
-        where: { id: batchId },
-        data: { status: "DONE", completedAt: new Date() },
-      });
-
-      // Re-fetch every drafted item across the WHOLE batch (not just this
-      // tick's slice) for the digest — earlier ticks' drafts need to be
-      // in the same email too.
-      const allDrafted = await prisma.productImportItem.findMany({
-        where: { batchId, status: "DRAFTED", resultProductDraftId: { not: null } },
-        select: { title: true, resultProductDraftId: true },
-      });
-      const drafts = await prisma.productDraft.findMany({
-        where: { id: { in: allDrafted.map((d) => d.resultProductDraftId) } },
-        select: { id: true, approvalToken: true },
-      });
-      const tokenByDraftId = new Map(drafts.map((d) => [d.id, d.approvalToken]));
-      const draftedItems = allDrafted
-        .map((d) => ({ title: d.title, token: tokenByDraftId.get(d.resultProductDraftId) }))
-        .filter((d) => d.token);
-
-      const supplier = await prisma.supplier.findUnique({ where: { id: updated.supplierId } });
-      try {
-        await sendBulkImportDigestEmail({
-          supplierName: supplier?.name || "Unknown supplier",
-          totalItems: updated.totalItems,
-          draftedItems,
-          linkedCount: updated.linkedCount,
-          failedCount: updated.failedCount,
-        });
-      } catch (err) {
-        console.error(`[job] productImportDrain: digest email failed for batch ${batchId}:`, err.message);
-      }
-    }
+    await finalizeBatchIfComplete(batchId);
   }
 
   return { processed: pending.length };

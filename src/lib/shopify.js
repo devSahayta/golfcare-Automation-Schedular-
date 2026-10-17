@@ -189,16 +189,32 @@ async function importAllProducts() {
 // those only matter at human-approval time, which still happens through
 // the existing backend productDraftController.js flow; this job only
 // ever creates drafts, never approves/publishes one.
+//
+// Takes `variants` directly (one real Shopify variant per entry) rather
+// than a single price/sku — a product can have several real variants
+// (e.g. a belt in 4 colors), each with its own price/SKU, created in ONE
+// product rather than as several separate single-variant products. A
+// plain single-variant product is just variants with one entry and
+// variantOptionName: null.
+/**
+ * @param {object} input
+ * @param {string} input.title
+ * @param {string} [input.category]
+ * @param {string} [input.specs]
+ * @param {string} [input.brand]
+ * @param {string} [input.imageUrl]
+ * @param {string|null} [input.variantOptionName] - e.g. "Color"/"Size", null for a single-variant product
+ * @param {{value: string|null, sku: string|null, mrp: number}[]} input.variants - at least one entry
+ * @returns {Promise<{shopifyProductId: string, variantResults: {shopifyVariantId: string, mrp: number}[], handle: string, imageIncluded: boolean}>}
+ */
 async function createDraftProduct({
   title,
-  price,
   category,
   specs,
   brand,
-  sku,
-  variantOptions,
   imageUrl,
-  quantity,
+  variantOptionName,
+  variants,
 }) {
   const accessToken = await getValidAccessToken();
   const client = axios.create({
@@ -210,15 +226,11 @@ async function createDraftProduct({
     timeout: 20000,
   });
 
-  const options = Array.isArray(variantOptions) ? variantOptions.slice(0, 3) : [];
-  const variant = { price: String(price) };
-  if (sku) variant.sku = sku;
-  if (quantity != null) {
-    variant.inventory_management = "shopify";
-    variant.inventory_quantity = quantity;
-  }
-  options.forEach((opt, i) => {
-    variant[`option${i + 1}`] = opt.value;
+  const shopifyVariants = variants.map((v) => {
+    const sv = { price: String(v.mrp) };
+    if (v.sku) sv.sku = v.sku;
+    if (variantOptionName && v.value) sv.option1 = v.value;
+    return sv;
   });
 
   const buildPayload = (withImage) => ({
@@ -228,8 +240,8 @@ async function createDraftProduct({
       product_type: category || undefined,
       vendor: brand || undefined,
       status: "draft",
-      ...(options.length ? { options: options.map((o) => ({ name: o.name })) } : {}),
-      variants: [variant],
+      ...(variantOptionName ? { options: [{ name: variantOptionName }] } : {}),
+      variants: shopifyVariants,
       ...(withImage && imageUrl ? { images: [{ src: imageUrl }] } : {}),
     },
   });
@@ -254,7 +266,10 @@ async function createDraftProduct({
 
   return {
     shopifyProductId: String(product.id),
-    shopifyVariantId: String(product.variants[0].id),
+    // Shopify returns variants in the same order they were submitted, so
+    // this lines up positionally with the `variants` input — used to
+    // match each real created variant back to its own mrp for cost sync.
+    variantResults: product.variants.map((v) => ({ shopifyVariantId: String(v.id), mrp: Number(v.price) })),
     handle: product.handle,
     imageIncluded,
   };

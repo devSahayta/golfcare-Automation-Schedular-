@@ -487,6 +487,11 @@ enum ImportItemStatus {
   DRAFTED
   LINKED_EXISTING
   FAILED
+  // No rate rule (see ProductImportBatch.rateRules) matched this item's
+  // brand/category — held back rather than guessing a margin/GST. Never
+  // picked up by the drain loop (which only queries PENDING); sits here
+  // until a human resolves it. Counted in ProductImportBatch.needsRateCount.
+  NEEDS_RATE
 }
 
 // A supplier sending a large catalog/price list (many new products at
@@ -505,10 +510,13 @@ model ProductImportBatch {
   draftedCount    Int               @default(0)
   linkedCount     Int               @default(0)
   failedCount     Int               @default(0)
+  needsRateCount  Int               @default(0)
   status          ImportBatchStatus @default(PENDING_EXTRACTION)
   rawDocumentText String?
-  marginPercent   Decimal?
-  gstPercent      Decimal?
+  // Margin/GST are NOT one blanket rate for the whole document — see
+  // golfcare-Automation-Backend-'s schema.prisma for the full comment on
+  // rateRules' shape and how extraction resolves each item against it.
+  rateRules       Json?
   extractionError String?
   createdAt       DateTime          @default(now())
   completedAt     DateTime?
@@ -522,9 +530,21 @@ model ProductImportItem {
   title                  String
   sku                    String?
   brand                  String?
+  // Inferred from the document's own section structure — used only to
+  // resolve this item's rate rule against ProductImportBatch.rateRules.
+  category               String?
   mrp                    Decimal
-  marginPercent          Decimal
-  gstPercent             Decimal
+  marginPercent          Decimal?
+  gstPercent             Decimal?
+  // One row is one Shopify PRODUCT, which may cover several real variants
+  // (e.g. a belt in 4 colors) — not one row per SKU. variantOptions holds
+  // the full list: [{value, sku, mrp}], one entry per real Shopify
+  // variant; variantOptionName is the dimension name ("Color"/"Size"),
+  // null for a single-variant product. Top-level sku/mrp above mirror the
+  // first variant, kept for simple display. See
+  // lib/claude/extractBulkCatalogItems.js for how a document's rows get
+  // grouped into this shape.
+  variantOptionName      String?
   variantOptions         Json?
   status                 ImportItemStatus  @default(PENDING)
   resultProductDraftId   String?
