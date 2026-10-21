@@ -134,9 +134,16 @@ model AgentUsage {
 
   conversation   Conversation @relation(fields: [conversationId], references: [id])
 
+  // SUPPLIER_BULK_IMPORT rows only — conversationId is the supplier's one
+  // ongoing WhatsApp thread, shared across every batch that supplier ever
+  // sends, so it can't tell two of their batches' costs apart. Set in
+  // productImportDrain.js wherever a batch id is known.
+  productImportBatchId String?
+
   @@index([conversationId])
   @@index([createdAt])
   @@index([agentName])
+  @@index([productImportBatchId])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.

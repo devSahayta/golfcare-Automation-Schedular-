@@ -104,6 +104,7 @@ async function extractPendingBatch() {
         await prisma.agentUsage.create({
           data: {
             conversationId: batch.conversationId,
+            productImportBatchId: batch.id,
             agentName: "SUPPLIER_BULK_IMPORT",
             model: "claude-sonnet-4-6",
             inputTokens: usage.inputTokens,
@@ -281,6 +282,7 @@ async function processItem(item, batch) {
         await prisma.agentUsage.create({
           data: {
             conversationId: batch.conversationId,
+            productImportBatchId: batch.id,
             agentName: "SUPPLIER_BULK_IMPORT",
             model: "claude-sonnet-4-6",
             inputTokens: research.usage.inputTokens,
