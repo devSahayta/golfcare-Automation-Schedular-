@@ -275,4 +275,36 @@ async function createDraftProduct({
   };
 }
 
-module.exports = { importAllProducts, getValidAccessToken, createDraftProduct };
+// Attaches a distinct image to one already-created variant — called in a
+// loop by processItem() after createDraftProduct() returns, once per
+// variant that ends up with a resolved image (document- or web-sourced).
+// Must run AFTER creation: Shopify variant IDs don't exist before that,
+// so there's no way to include this in the initial product-creation
+// payload. POSTing an image with variant_ids creates the image AND sets
+// that variant's image_id in the same call — no separate link step.
+// Best-effort from the caller's side: this throws on failure, processItem()
+// logs-and-continues, same posture as the cost-sync loop right below it.
+/**
+ * @param {string} shopifyProductId
+ * @param {string} shopifyVariantId
+ * @param {string} imageUrl
+ * @returns {Promise<{shopifyImageId: string}>}
+ */
+async function addVariantImage(shopifyProductId, shopifyVariantId, imageUrl) {
+  const accessToken = await getValidAccessToken();
+  const client = axios.create({
+    baseURL: `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
+    headers: {
+      "X-Shopify-Access-Token": accessToken,
+      "Content-Type": "application/json",
+    },
+    timeout: 20000,
+  });
+
+  const res = await client.post(`/products/${shopifyProductId}/images.json`, {
+    image: { src: imageUrl, variant_ids: [Number(shopifyVariantId)] },
+  });
+  return { shopifyImageId: String(res.data.image.id) };
+}
+
+module.exports = { importAllProducts, getValidAccessToken, createDraftProduct, addVariantImage };

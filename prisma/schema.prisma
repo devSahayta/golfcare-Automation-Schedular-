@@ -520,6 +520,12 @@ model ProductImportBatch {
   needsRateCount  Int               @default(0)
   status          ImportBatchStatus @default(PENDING_EXTRACTION)
   rawDocumentText String?
+  // The original WhatsApp attachment's own Message.mediaUrl, captured at
+  // batch-creation time (backend's start_bulk_product_import). Lets this
+  // repo's extraction step re-fetch the raw PDF bytes to pull embedded
+  // product photos per page/variant — see lib/pdfImageExtractor.js. Null
+  // for batches created before this existed.
+  sourceMediaUrl  String?
   // Margin/GST are NOT one blanket rate for the whole document — see
   // golfcare-Automation-Backend-'s schema.prisma for the full comment on
   // rateRules' shape and how extraction resolves each item against it.

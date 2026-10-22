@@ -24,12 +24,15 @@
 
 const cron = require("node-cron");
 const crypto = require("crypto");
+const axios = require("axios");
 const { prisma } = require("../lib/prisma");
 const { setAvailability } = require("../services/availabilityService");
 const { findExistingCatalogMatch } = require("../lib/productCatalogMatch");
-const { researchProductSpecs } = require("../lib/claude/researchProductSpecs");
+const { researchProductSpecs, researchVariantImage } = require("../lib/claude/researchProductSpecs");
 const { extractBulkCatalogItems } = require("../lib/claude/extractBulkCatalogItems");
-const { createDraftProduct } = require("../lib/shopify");
+const { extractPdfPagesWithImages } = require("../lib/pdfImageExtractor");
+const { uploadDocumentImage } = require("../lib/supabaseStorage");
+const { createDraftProduct, addVariantImage } = require("../lib/shopify");
 const { updateInventoryItemCost } = require("../lib/shopifyInventory");
 const { computeCostPrice } = require("../lib/pricingCalculator");
 const { sendBulkImportDigestEmail } = require("../lib/email/sendBulkImportDigestEmail");
@@ -81,7 +84,53 @@ function resolveRate(rateRules, item) {
   return best ? { marginPercent: best.marginPercent, gstPercent: best.gstPercent } : null;
 }
 
-// Parses one PENDING_EXTRACTION batch's raw document text into real
+// Re-fetches the original PDF (sourceMediaUrl, set at batch-creation time
+// by backend's start_bulk_product_import) and pulls its embedded product
+// photos + per-page text (pdfImageExtractor.js), uploading each DISTINCT
+// image exactly once (by content hash — a repeated logo/banner across many
+// pages shouldn't become many uploads) to Supabase Storage. Images are
+// renumbered with a GLOBALLY unique index across the whole document before
+// being handed to extractBulkCatalogItems — a per-page-local index (0, 1,
+// 2...) would collide across pages once several pages' images land in the
+// same Claude call (page-batched, see PAGES_PER_SEGMENT), so there'd be no
+// way to tell "page 1's image 0" from "page 4's image 0" apart when
+// resolving documentImageIndex back to a real URL afterward.
+async function extractPagesWithUploadedImages(batch) {
+  const pdfRes = await axios.get(batch.sourceMediaUrl, { responseType: "arraybuffer" });
+  const pdfBuffer = Buffer.from(pdfRes.data);
+  const { pages, skippedNonJpegImageCount } = await extractPdfPagesWithImages(pdfBuffer);
+
+  const hashToGlobalIndex = new Map();
+  const globalIndexToUrl = new Map();
+  let nextGlobalIndex = 0;
+  const pagesForExtraction = [];
+
+  for (const page of pages) {
+    const renumberedImages = [];
+    for (const img of page.images) {
+      let globalIndex = hashToGlobalIndex.get(img.contentHash);
+      if (globalIndex === undefined) {
+        globalIndex = nextGlobalIndex++;
+        hashToGlobalIndex.set(img.contentHash, globalIndex);
+        const url = await uploadDocumentImage(img.bytes, `batch-${batch.id}-img-${globalIndex}.jpg`);
+        globalIndexToUrl.set(globalIndex, url);
+      }
+      renumberedImages.push({ index: globalIndex, mimeType: img.mimeType, bytes: img.bytes });
+    }
+    pagesForExtraction.push({ pageNumber: page.pageNumber, text: page.text, images: renumberedImages });
+  }
+
+  if (skippedNonJpegImageCount > 0) {
+    console.log(
+      `[job] productImportDrain: batch ${batch.id} had ${skippedNonJpegImageCount} non-JPEG embedded image(s) that couldn't be extracted (v1 is JPEG/DCTDecode only).`,
+    );
+  }
+
+  return { pagesForExtraction, globalIndexToUrl };
+}
+
+// Parses one PENDING_EXTRACTION batch's raw document text (and, when
+// sourceMediaUrl is set, its real embedded product photos) into real
 // ProductImportItem rows, then flips it to PROCESSING so the normal
 // draining loop below picks it up exactly like any other batch. One
 // batch per tick — a genuinely huge document's extraction (several
@@ -95,9 +144,34 @@ async function extractPendingBatch() {
   if (!batch) return null;
 
   try {
-    const { items, usage, cost, segmentCount } = await extractBulkCatalogItems({
-      documentText: batch.rawDocumentText || "",
-    });
+    let rawResult;
+    let globalIndexToUrl = new Map();
+
+    // No sourceMediaUrl means this batch predates the feature — falls back
+    // to the original text-only path untouched, not a backfill target.
+    if (batch.sourceMediaUrl) {
+      const prepared = await extractPagesWithUploadedImages(batch);
+      globalIndexToUrl = prepared.globalIndexToUrl;
+      rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction });
+    } else {
+      rawResult = await extractBulkCatalogItems({ documentText: batch.rawDocumentText || "" });
+    }
+
+    // Resolve each variant's documentImageIndex (meaningless outside this
+    // function — a global index into globalIndexToUrl, nothing else knows
+    // what to do with it) into a real documentImageUrl, or null when there
+    // wasn't a confident match (legacy text-only path: always null here,
+    // same as every variant always has been until this feature existed).
+    const items = rawResult.items.map((it) => ({
+      ...it,
+      variants: it.variants.map((v) => ({
+        value: v.value,
+        sku: v.sku,
+        mrp: v.mrp,
+        documentImageUrl: v.documentImageIndex != null ? globalIndexToUrl.get(v.documentImageIndex) || null : null,
+      })),
+    }));
+    const { usage, cost, segmentCount } = rawResult;
 
     if (batch.conversationId) {
       try {
@@ -209,7 +283,7 @@ async function processItem(item, batch) {
     // from crashing if it ever does.
     const variants = Array.isArray(item.variantOptions) && item.variantOptions.length > 0
       ? item.variantOptions
-      : [{ value: null, sku: item.sku, mrp: Number(item.mrp) }];
+      : [{ value: null, sku: item.sku, mrp: Number(item.mrp), documentImageUrl: null }];
 
     // Duplicate-check against the whole catalog, one probe per variant —
     // if ANY variant matches something that already exists, the simplest
@@ -266,17 +340,19 @@ async function processItem(item, batch) {
       return { kind: "linked" };
     }
 
-    // Genuinely new. Research fills specs/image only if missing — a
+    // Genuinely new. Specs research runs once per item regardless (a
     // document that already gave a usable description would skip this,
-    // but bulk-imported rows never carry one (just title/sku/mrp), so
-    // this always runs here.
-    const research = await researchProductSpecs({ title: item.title, brand: item.brand });
+    // but bulk-imported rows never carry one — just title/sku/mrp). Only
+    // asks it to ALSO search for an image when there's exactly one variant
+    // and the document didn't already supply a photo for it — for any
+    // item with real multiple variants, a shared/guessed image at the
+    // product level isn't wanted at all; each variant gets its own
+    // resolution below instead (document photo, or its own dedicated
+    // researchVariantImage call), never a single image reused across
+    // colors/sizes.
+    const needsSharedImage = variants.length === 1 && !variants[0].documentImageUrl;
+    const research = await researchProductSpecs({ title: item.title, brand: item.brand, needsImage: needsSharedImage });
 
-    // Real, now-approved spend (boss sign-off on bulk onboarding cost) —
-    // logged the same way every other Module 6 Claude call is, so it
-    // shows up alongside Sales/Supplier/Lifecycle usage once that part of
-    // the dashboard is built. batch.conversationId is the real supplier
-    // conversation the document arrived on (set by start_bulk_product_import).
     if (batch.conversationId) {
       try {
         await prisma.agentUsage.create({
@@ -298,14 +374,81 @@ async function processItem(item, batch) {
       }
     }
 
+    // Resolve each variant's own final image: the document's own photo if
+    // it has one (free — already extracted/uploaded), else the shared
+    // research result for the single-variant case, else its own dedicated
+    // per-variant web search — confirmed/accepted trade-off: a multi-color
+    // product with no document photos runs one researchVariantImage call
+    // PER missing color, not one shared search reused across all of them.
+    for (const v of variants) {
+      if (v.documentImageUrl) {
+        v.resolvedImageUrl = v.documentImageUrl;
+        continue;
+      }
+      if (variants.length === 1) {
+        v.resolvedImageUrl = research.imageUrl || null;
+        continue;
+      }
+      const imgResearch = await researchVariantImage({ title: item.title, brand: item.brand, variantValue: v.value });
+      v.resolvedImageUrl = imgResearch.imageUrl || null;
+      if (batch.conversationId) {
+        try {
+          await prisma.agentUsage.create({
+            data: {
+              conversationId: batch.conversationId,
+              productImportBatchId: batch.id,
+              agentName: "SUPPLIER_BULK_IMPORT",
+              model: "claude-sonnet-4-6",
+              inputTokens: imgResearch.usage.inputTokens,
+              outputTokens: imgResearch.usage.outputTokens,
+              costUsd: imgResearch.cost.usd,
+              costInr: imgResearch.cost.inr,
+              toolCallCount: 1,
+              outcome: imgResearch.imageUrl ? "variant_image_researched" : "no_result",
+            },
+          });
+        } catch (err) {
+          console.error(`[job] productImportDrain: AgentUsage log failed for item ${item.id} variant ${v.value}:`, err.message);
+        }
+      }
+    }
+
+    // Initial product-level image for the creation call itself — real
+    // per-variant images get attached as a follow-up step below (Shopify
+    // variant IDs don't exist until after creation), this is just so the
+    // product isn't image-less in the meantime if that follow-up partially
+    // fails. Prefers the shared research result, else the first variant
+    // that actually resolved one.
+    const fallbackImageUrl = research.imageUrl || variants.find((v) => v.resolvedImageUrl)?.resolvedImageUrl || null;
+
     const shopifyResult = await createDraftProduct({
       title: item.title,
       specs: research.specs,
       brand: item.brand || undefined,
       variantOptionName: item.variantOptionName || null,
       variants,
-      imageUrl: research.imageUrl,
+      imageUrl: fallbackImageUrl,
     });
+
+    // Attach each variant's own resolved image (document- or web-sourced)
+    // now that real Shopify variant IDs exist — variantResults is
+    // positionally matched to `variants`, same guarantee the cost-sync
+    // loop right below already relies on. Best-effort: a failed attach
+    // here doesn't lose the draft, same posture as the cost-sync loop.
+    await Promise.all(
+      shopifyResult.variantResults.map(async (vr, i) => {
+        const resolvedImageUrl = variants[i]?.resolvedImageUrl;
+        if (!resolvedImageUrl) return;
+        try {
+          await addVariantImage(shopifyResult.shopifyProductId, vr.shopifyVariantId, resolvedImageUrl);
+        } catch (err) {
+          console.error(
+            `[job] productImportDrain: addVariantImage failed for variant ${vr.shopifyVariantId} on ${shopifyResult.shopifyProductId}:`,
+            err.response?.data || err.message,
+          );
+        }
+      }),
+    );
 
     // One cost-price sync per real Shopify variant — margin/GST are the
     // batch's blanket rate, but each variant can have its own MRP (rare
@@ -333,11 +476,16 @@ async function processItem(item, batch) {
     const approvalToken = crypto.randomBytes(24).toString("hex");
     const tokenExpiresAt = new Date(Date.now() + TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 
+    const anyDocumentImage = variants.some((v) => v.documentImageUrl);
     const draft = await prisma.productDraft.create({
       data: {
         shopifyDraftProductId: shopifyResult.shopifyProductId,
         supplierId: batch.supplierId,
-        sourceType: research.specs || research.imageUrl ? "WEB_SCRAPED" : "SUPPLIER_PROVIDED",
+        // A real photo pulled from the supplier's own document is more
+        // "SUPPLIER_PROVIDED" in spirit than "WEB_SCRAPED", even though it
+        // arrived via the bulk-document pipeline rather than a direct
+        // WhatsApp photo — takes priority over whether research also ran.
+        sourceType: anyDocumentImage || !(research.specs || research.imageUrl) ? "SUPPLIER_PROVIDED" : "WEB_SCRAPED",
         rawPayload: {
           title: item.title,
           brand: item.brand || null,
@@ -347,6 +495,7 @@ async function processItem(item, batch) {
             sku: variants[i]?.sku || null,
             mrp: vr.mrp,
             costPrice: vr.costPrice,
+            imageUrl: variants[i]?.resolvedImageUrl || null,
           })),
           // Mirrors of the first/primary variant, in the exact field
           // names backend's productDraftController.js (the shared
@@ -368,7 +517,7 @@ async function processItem(item, batch) {
           marginPercent: Number(item.marginPercent),
           gstPercent: Number(item.gstPercent),
           specs: research.specs,
-          imageUrl: research.imageUrl,
+          imageUrl: fallbackImageUrl,
           sourceNotes: research.sourceNotes || "Bulk catalog import — no per-item supplier Q&A, margin/GST are the batch's blanket rate.",
         },
         approvalToken,
