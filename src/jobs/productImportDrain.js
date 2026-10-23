@@ -36,6 +36,7 @@ const { createDraftProduct, addVariantImage } = require("../lib/shopify");
 const { updateInventoryItemCost } = require("../lib/shopifyInventory");
 const { computeCostPrice } = require("../lib/pricingCalculator");
 const { sendBulkImportDigestEmail } = require("../lib/email/sendBulkImportDigestEmail");
+const { sendBulkImportCompletionMessage } = require("../lib/sendBulkImportCompletionMessage");
 
 const BATCH_SIZE = Number(process.env.PRODUCT_IMPORT_BATCH_SIZE || 5);
 const PACE_MS = Number(process.env.PRODUCT_IMPORT_PACE_MS || 2000);
@@ -592,6 +593,19 @@ async function finalizeBatchIfComplete(batchId) {
     });
   } catch (err) {
     console.error(`[job] productImportDrain: digest email failed for batch ${batchId}:`, err.message);
+  }
+
+  if (supplier) {
+    try {
+      await sendBulkImportCompletionMessage({
+        supplier,
+        draftedCount: draftedItems.length,
+        linkedCount: updated.linkedCount,
+        needsRateCount: needsRateItems.length,
+      });
+    } catch (err) {
+      console.error(`[job] productImportDrain: supplier completion message failed for batch ${batchId}:`, err.message);
+    }
   }
 }
 
