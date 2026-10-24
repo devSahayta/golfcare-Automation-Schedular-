@@ -14,9 +14,12 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",
     "@prisma/client": "^5.19.0",
+    "@supabase/supabase-js": "^2.118.0",
     "axios": "^1.19.0",
     "dotenv": "^17.4.2",
     "node-cron": "^4.6.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.4.299",
     "prisma": "^5.19.0",
     "resend": "^6.25.0"
   }

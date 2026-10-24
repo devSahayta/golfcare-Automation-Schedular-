@@ -182,4 +182,129 @@ async function importAllProducts() {
   return { totalImported, pages };
 }
 
-module.exports = { importAllProducts, getValidAccessToken };
+// Mirrors golfcare-backend's services/shopifyProductCreate.js createDraftProduct
+// — used by jobs/productImportDrain.js to create a real (unpublished)
+// Shopify draft product per genuinely-new bulk-import item. Deliberately
+// doesn't include the backend's publishProduct/publishToAllChannels —
+// those only matter at human-approval time, which still happens through
+// the existing backend productDraftController.js flow; this job only
+// ever creates drafts, never approves/publishes one.
+//
+// Takes `variants` directly (one real Shopify variant per entry) rather
+// than a single price/sku — a product can have several real variants
+// (e.g. a belt in 4 colors), each with its own price/SKU, created in ONE
+// product rather than as several separate single-variant products. A
+// plain single-variant product is just variants with one entry and
+// variantOptionName: null.
+/**
+ * @param {object} input
+ * @param {string} input.title
+ * @param {string} [input.category]
+ * @param {string} [input.specs]
+ * @param {string} [input.brand]
+ * @param {string} [input.imageUrl]
+ * @param {string|null} [input.variantOptionName] - e.g. "Color"/"Size", null for a single-variant product
+ * @param {{value: string|null, sku: string|null, mrp: number}[]} input.variants - at least one entry
+ * @returns {Promise<{shopifyProductId: string, variantResults: {shopifyVariantId: string, mrp: number}[], handle: string, imageIncluded: boolean}>}
+ */
+async function createDraftProduct({
+  title,
+  category,
+  specs,
+  brand,
+  imageUrl,
+  variantOptionName,
+  variants,
+}) {
+  const accessToken = await getValidAccessToken();
+  const client = axios.create({
+    baseURL: `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
+    headers: {
+      "X-Shopify-Access-Token": accessToken,
+      "Content-Type": "application/json",
+    },
+    timeout: 20000,
+  });
+
+  const shopifyVariants = variants.map((v) => {
+    const sv = { price: String(v.mrp) };
+    if (v.sku) sv.sku = v.sku;
+    if (variantOptionName && v.value) sv.option1 = v.value;
+    return sv;
+  });
+
+  const buildPayload = (withImage) => ({
+    product: {
+      title,
+      body_html: specs || undefined,
+      product_type: category || undefined,
+      vendor: brand || undefined,
+      status: "draft",
+      ...(variantOptionName ? { options: [{ name: variantOptionName }] } : {}),
+      variants: shopifyVariants,
+      ...(withImage && imageUrl ? { images: [{ src: imageUrl }] } : {}),
+    },
+  });
+
+  let product;
+  try {
+    const res = await client.post("/products.json", buildPayload(true));
+    product = res.data.product;
+  } catch (err) {
+    if (!imageUrl) throw err;
+    // Same recoverable-failure reasoning as the backend version — a dead
+    // image src shouldn't lose the whole draft.
+    console.error(
+      "[shopify] createDraftProduct with image failed, retrying without image:",
+      err.response?.data || err.message,
+    );
+    const res = await client.post("/products.json", buildPayload(false));
+    product = res.data.product;
+  }
+
+  const imageIncluded = Boolean(product.images && product.images.length > 0);
+
+  return {
+    shopifyProductId: String(product.id),
+    // Shopify returns variants in the same order they were submitted, so
+    // this lines up positionally with the `variants` input — used to
+    // match each real created variant back to its own mrp for cost sync.
+    variantResults: product.variants.map((v) => ({ shopifyVariantId: String(v.id), mrp: Number(v.price) })),
+    handle: product.handle,
+    imageIncluded,
+  };
+}
+
+// Attaches a distinct image to one already-created variant — called in a
+// loop by processItem() after createDraftProduct() returns, once per
+// variant that ends up with a resolved image (document- or web-sourced).
+// Must run AFTER creation: Shopify variant IDs don't exist before that,
+// so there's no way to include this in the initial product-creation
+// payload. POSTing an image with variant_ids creates the image AND sets
+// that variant's image_id in the same call — no separate link step.
+// Best-effort from the caller's side: this throws on failure, processItem()
+// logs-and-continues, same posture as the cost-sync loop right below it.
+/**
+ * @param {string} shopifyProductId
+ * @param {string} shopifyVariantId
+ * @param {string} imageUrl
+ * @returns {Promise<{shopifyImageId: string}>}
+ */
+async function addVariantImage(shopifyProductId, shopifyVariantId, imageUrl) {
+  const accessToken = await getValidAccessToken();
+  const client = axios.create({
+    baseURL: `https://${process.env.SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
+    headers: {
+      "X-Shopify-Access-Token": accessToken,
+      "Content-Type": "application/json",
+    },
+    timeout: 20000,
+  });
+
+  const res = await client.post(`/products/${shopifyProductId}/images.json`, {
+    image: { src: imageUrl, variant_ids: [Number(shopifyVariantId)] },
+  });
+  return { shopifyImageId: String(res.data.image.id) };
+}
+
+module.exports = { importAllProducts, getValidAccessToken, createDraftProduct, addVariantImage };

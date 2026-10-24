@@ -22,6 +22,11 @@ const {
 const {
   registerShopifySyncQueueDrainJob,
 } = require("./jobs/shopifySyncQueueDrain");
+const { registerProductImportDrainJob } = require("./jobs/productImportDrain");
+
+const {
+  registerCampaignImageCleanupJob,
+} = require("./jobs/campaignImageCleanup");
 
 console.log("Golf Care OS scheduler starting...");
 
@@ -35,5 +40,7 @@ registerApprovalTokenExpirySweepJob();
 // add near the other register calls:
 registerShopifyReconciliationJob();
 registerShopifySyncQueueDrainJob();
+registerProductImportDrainJob();
+registerCampaignImageCleanupJob();
 
 console.log("Golf Care OS scheduler: all jobs registered.");

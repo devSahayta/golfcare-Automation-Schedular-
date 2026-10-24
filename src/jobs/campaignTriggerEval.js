@@ -148,6 +148,16 @@ async function logSendAndCloseTrigger({ customer, trigger, status, templateName,
     data: { lastMessageAt: new Date(), intent: `campaign_reply:${scenario}` },
   });
   await prisma.campaignTrigger.update({ where: { id: trigger.id }, data: { status } });
+  await prisma.auditLog.create({
+    data: {
+      actorType: "AGENT",
+      action: "campaign_message_sent",
+      entityType: "CampaignTrigger",
+      entityId: trigger.id,
+      afterState: { scenario, customerId: customer.id, templateName: templateName || null, status },
+      source: "campaign_trigger_eval",
+    },
+  });
 }
 
 async function evaluateBirthdays() {
@@ -315,6 +325,7 @@ async function evaluateCrossSell() {
       });
 
       const firstName = customer.firstName || "there";
+      const hadLocalImage = Boolean(targetProduct.imageUrls?.[0]);
       try {
         const draft = await draftDynamicTemplate({
           scenario: "CROSS_SELL",
@@ -373,6 +384,42 @@ async function evaluateCrossSell() {
         });
 
         await prisma.campaignTrigger.update({ where: { id: trigger.id }, data: { status: "TEMPLATE_CREATED" } });
+
+        // AgentUsage.conversationId is NOT NULL — a proactive draft has no
+        // conversation yet, so resolve/create the customer's one here. This
+        // is the same lookup logSendAndCloseTrigger uses for static-lane
+        // sends, so cross-sell usage lands in the customer's one real thread.
+        const conversation = await resolveCustomerConversation(customer);
+        await prisma.agentUsage.create({
+          data: {
+            conversationId: conversation.id,
+            agentName: "LIFECYCLE",
+            model: draft.model || null,
+            inputTokens: draft.usage.inputTokens || 0,
+            outputTokens: draft.usage.outputTokens || 0,
+            costUsd: draft.cost.usd || 0,
+            costInr: draft.cost.inr || 0,
+            toolCallCount: hadLocalImage ? 0 : 1,
+            outcome: "drafted",
+          },
+        });
+        await prisma.auditLog.create({
+          data: {
+            actorType: "AGENT",
+            action: "campaign_template_drafted",
+            entityType: "DynamicTemplate",
+            entityId: dynamicTemplate.id,
+            afterState: {
+              scenario: "CROSS_SELL",
+              customerId: customer.id,
+              templateName,
+              hasImage: Boolean(draft.imageUrl),
+              usedWebSearchFallback: !hadLocalImage,
+            },
+            source: "campaign_trigger_eval",
+          },
+        });
+
         drafted += 1;
       } catch (err) {
         console.error(`[job] campaignTriggerEval: cross-sell draft failed for ${customer.id}:`, err.message);

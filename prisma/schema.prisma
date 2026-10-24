@@ -6,7 +6,6 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
-
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model AuditLog {
   id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -107,12 +106,45 @@ model Conversation {
   Supplier           Supplier?            @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
   Message            Message[]
   OnboardingResponse OnboardingResponse[]
-    AgentUsage       AgentUsage[]
-     totalCostUsd    Float                   @default(0)
-  totalCostInr        Float                          @default(0)
+    AgentUsage         AgentUsage[]
+  totalCostUsd       Float        @default(0)
+  totalCostInr       Float        @default(0)
 
   @@index([customerId], map: "idx_conversation_customer")
   @@index([waPhone], map: "idx_conversation_wa_phone")
+}
+
+// Added for Module 6 — the Lifecycle Agent's drafting calls need the same
+// AgentUsage logging every other agent already has. This table exists in
+// the shared DB already (populated by the backend's agentEngine/logger.js
+// for other agents) — this model just gives the scheduler's own Prisma
+// client visibility into it, kept in sync with the backend's copy per
+// this repo's cross-repo duplication convention.
+model AgentUsage {
+  id             String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  conversationId String
+  agentName      String   @default("unknown")
+  inputTokens    Int      @default(0)
+  outputTokens   Int      @default(0)
+  costUsd        Decimal  @default(0) @db.Decimal(10, 6)
+  costInr        Decimal  @default(0) @db.Decimal(10, 4)
+  toolCallCount  Int      @default(0)
+  outcome        String
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  model          String?
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+
+  // SUPPLIER_BULK_IMPORT rows only — conversationId is the supplier's one
+  // ongoing WhatsApp thread, shared across every batch that supplier ever
+  // sends, so it can't tell two of their batches' costs apart. Set in
+  // productImportDrain.js wherever a batch id is known.
+  productImportBatchId String?
+
+  @@index([conversationId])
+  @@index([createdAt])
+  @@index([agentName])
+  @@index([productImportBatchId])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -152,6 +184,7 @@ model Customer {
   OnboardingResponse    OnboardingResponse[]
   Order                 Order[]
   consentVersion        String?
+  BroadcastRecipient BroadcastRecipient[] 
 
   @@index([waPhone], map: "idx_customer_wa_phone")
 }
@@ -468,6 +501,7 @@ model StaffUser {
   InsightsUsage InsightsUsage[]
   totalInsightsCostUsd Decimal @default(0) @db.Decimal(10, 6)
   totalInsightsCostInr Decimal @default(0) @db.Decimal(10, 4)
+  BroadcastCampaign BroadcastCampaign[]
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -489,6 +523,96 @@ model Supplier {
   ProductDraft     ProductDraft[]
   SupplierCheck    SupplierCheck[]
   SupplierProduct  SupplierProduct[]
+  ProductImportBatch ProductImportBatch[]
+}
+
+enum ImportBatchStatus {
+  PENDING_EXTRACTION
+  PROCESSING
+  DONE
+}
+
+enum ImportItemStatus {
+  PENDING
+  RESEARCHING
+  DRAFTED
+  LINKED_EXISTING
+  FAILED
+  // No rate rule (see ProductImportBatch.rateRules) matched this item's
+  // brand/category — held back rather than guessing a margin/GST. Never
+  // picked up by the drain loop (which only queries PENDING); sits here
+  // until a human resolves it. Counted in ProductImportBatch.needsRateCount.
+  NEEDS_RATE
+}
+
+// A supplier sending a large catalog/price list (many new products at
+// once) can't be processed inline during the backend chat turn — see
+// golfcare-Automation-Backend-'s start_bulk_product_import tool, which
+// writes these rows, and jobs/productImportDrain.js below, which drains
+// them gradually (duplicate-check, research, real Shopify draft
+// creation) with no request-timeout risk since this runs as a Render
+// background worker, not a Vercel function.
+model ProductImportBatch {
+  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  supplierId      String
+  conversationId  String?
+  totalItems      Int               @default(0)
+  processedItems  Int               @default(0)
+  draftedCount    Int               @default(0)
+  linkedCount     Int               @default(0)
+  failedCount     Int               @default(0)
+  needsRateCount  Int               @default(0)
+  status          ImportBatchStatus @default(PENDING_EXTRACTION)
+  rawDocumentText String?
+  // The original WhatsApp attachment's own Message.mediaUrl, captured at
+  // batch-creation time (backend's start_bulk_product_import). Lets this
+  // repo's extraction step re-fetch the raw PDF bytes to pull embedded
+  // product photos per page/variant — see lib/pdfImageExtractor.js. Null
+  // for batches created before this existed.
+  sourceMediaUrl  String?
+  // Margin/GST are NOT one blanket rate for the whole document — see
+  // golfcare-Automation-Backend-'s schema.prisma for the full comment on
+  // rateRules' shape and how extraction resolves each item against it.
+  rateRules       Json?
+  extractionError String?
+  createdAt       DateTime          @default(now())
+  completedAt     DateTime?
+  Supplier        Supplier          @relation(fields: [supplierId], references: [id])
+  Items           ProductImportItem[]
+}
+
+model ProductImportItem {
+  id                     String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  batchId                String
+  title                  String
+  sku                    String?
+  brand                  String?
+  // Inferred from the document's own section structure — used only to
+  // resolve this item's rate rule against ProductImportBatch.rateRules.
+  category               String?
+  mrp                    Decimal
+  marginPercent          Decimal?
+  gstPercent             Decimal?
+  // One row is one Shopify PRODUCT, which may cover several real variants
+  // (e.g. a belt in 4 colors) — not one row per SKU. variantOptions holds
+  // the full list: [{value, sku, mrp}], one entry per real Shopify
+  // variant; variantOptionName is the dimension name ("Color"/"Size"),
+  // null for a single-variant product. Top-level sku/mrp above mirror the
+  // first variant, kept for simple display. See
+  // lib/claude/extractBulkCatalogItems.js for how a document's rows get
+  // grouped into this shape.
+  variantOptionName      String?
+  variantOptions         Json?
+  status                 ImportItemStatus  @default(PENDING)
+  resultProductDraftId   String?
+  resultMatchedProductId String?
+  errorMessage           String?
+  createdAt              DateTime          @default(now())
+  processedAt            DateTime?
+  Batch                  ProductImportBatch @relation(fields: [batchId], references: [id])
+
+  @@index([status])
+  @@index([batchId])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -547,26 +671,6 @@ model Variant {
   @@index([productId], map: "idx_variant_product")
 }
 
-model AgentUsage {
-  id             String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  conversationId String
-  agentName      String   @default("unknown")
-  inputTokens    Int      @default(0)
-  outputTokens   Int      @default(0)
-  costUsd        Decimal  @default(0) @db.Decimal(10, 6)
-  costInr        Decimal  @default(0) @db.Decimal(10, 4)
-  toolCallCount  Int      @default(0)
-  outcome        String
-  createdAt      DateTime @default(now()) @db.Timestamptz(6)
-
-  conversation   Conversation @relation(fields: [conversationId], references: [id])
-  model String?
-
-  @@index([conversationId])
-  @@index([createdAt])
-  @@index([agentName])
-}
-
 model InsightsUsage {
   id            String    @id @default(dbgenerated("(gen_random_uuid())::text"))
   staffUserId   String?
@@ -584,6 +688,85 @@ model InsightsUsage {
 
   @@index([staffUserId])
   @@index([createdAt])
+}
+
+model BroadcastCampaign {
+  id                  String             @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name                String
+  status              BroadcastStatus    @default(DRAFT)
+  createdByStaffId    String?
+  agentPrompt         String?
+  audienceRules       Json
+  audienceSize        Int                @default(0)
+  templateName        String             @unique
+  category            TemplateCategory   @default(MARKETING)
+  bodyText            String
+  headerImageUrl      String?
+  samvaadikWtId       String?
+  metaStatus          MetaTemplateStatus @default(NOT_SUBMITTED)
+  metaSubmittedAt     DateTime?          @db.Timestamptz(6)
+  metaApprovedAt      DateTime?          @db.Timestamptz(6)
+  metaRejectionReason String?
+  confirmedAt         DateTime?          @db.Timestamptz(6)
+  scheduledFor        DateTime?          @db.Timestamptz(6)
+  sentCount           Int                @default(0)
+  failedCount         Int                @default(0)
+  skippedCount        Int                @default(0)
+  completedAt         DateTime?          @db.Timestamptz(6)
+  deleteAfter         DateTime?          @db.Timestamptz(6)
+  deleteStatus        DeleteStatus       @default(NOT_DUE)
+  deletedAt           DateTime?          @db.Timestamptz(6)
+  createdAt           DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime           @default(now()) @updatedAt @db.Timestamptz(6)
+  StaffUser           StaffUser?         @relation(fields: [createdByStaffId], references: [id], onUpdate: NoAction)
+  BroadcastRecipient  BroadcastRecipient[]
+  headerType          String?            @default("NONE")
+  headerText          String?
+  footerText          String?
+  buttons             Json?              @default("[]")
+  imageDeletedAt      DateTime?          @db.Timestamptz(6)
+
+  @@index([status], map: "idx_broadcastcampaign_status")
+}
+
+model BroadcastRecipient {
+  id                String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  campaignId        String
+  customerId        String
+  phone             String
+  firstName         String?
+  status            RecipientStatus   @default(PENDING)
+  samvaadikSmId     String?
+  waMessageId       String?
+  skipReason        String?
+  errorMessage      String?
+  sentAt            DateTime?         @db.Timestamptz(6)
+  createdAt         DateTime          @default(now()) @db.Timestamptz(6)
+  BroadcastCampaign BroadcastCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Customer          Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([campaignId, customerId])
+  @@index([campaignId, status], map: "idx_broadcastrecipient_campaign_status")
+}
+
+enum BroadcastStatus {
+  DRAFT
+  SUBMITTED
+  READY
+  SCHEDULED
+  COMPLETED
+  REJECTED
+  CANCELLED
+  FAILED
+  PENDING_SCHEDULE
+}
+
+enum RecipientStatus {
+  PENDING
+  SCHEDULED
+  SENT
+  FAILED
+  SKIPPED
 }
 
 enum ActorType {
