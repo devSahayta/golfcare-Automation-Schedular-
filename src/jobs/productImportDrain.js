@@ -27,7 +27,8 @@ const crypto = require("crypto");
 const axios = require("axios");
 const { prisma } = require("../lib/prisma");
 const { setAvailability } = require("../services/availabilityService");
-const { findExistingCatalogMatch } = require("../lib/productCatalogMatch");
+const { findExistingCatalogMatch, findPendingDraftMatch } = require("../lib/productCatalogMatch");
+const { broadTagFor } = require("../lib/shopifyTaxonomy");
 const { researchProductSpecs, researchVariantImage } = require("../lib/claude/researchProductSpecs");
 const { extractBulkCatalogItems } = require("../lib/claude/extractBulkCatalogItems");
 const { extractPdfPagesWithImages } = require("../lib/pdfImageExtractor");
@@ -214,6 +215,7 @@ async function extractPendingBatch() {
           sku: i.variants[0].sku || null,
           brand: i.brand || null,
           category: i.category || null,
+          shopifyProductType: i.productType || null,
           mrp: i.variants[0].mrp,
           marginPercent: rate?.marginPercent ?? null,
           gstPercent: rate?.gstPercent ?? null,
@@ -341,6 +343,20 @@ async function processItem(item, batch) {
       return { kind: "linked" };
     }
 
+    // Not live in the catalog yet — but it might already be SUBMITTED
+    // (one-by-one chat flow, or an earlier bulk batch) and just sitting
+    // unapproved, which findExistingCatalogMatch above can't see (no
+    // Product/Variant row exists for it yet). Confirmed live: the same
+    // item got drafted twice, a day apart, once via each flow.
+    const pendingMatch = await findPendingDraftMatch({ title: item.title, sku: variants[0]?.sku });
+    if (pendingMatch) {
+      await prisma.productImportItem.update({
+        where: { id: item.id },
+        data: { status: "ALREADY_DRAFTED", resultProductDraftId: pendingMatch.draftId, processedAt: new Date() },
+      });
+      return { kind: "already_drafted" };
+    }
+
     // Genuinely new. Specs research runs once per item regardless (a
     // document that already gave a usable description would skip this,
     // but bulk-imported rows never carry one — just title/sku/mrp). Only
@@ -422,13 +438,22 @@ async function processItem(item, batch) {
     // that actually resolved one.
     const fallbackImageUrl = research.imageUrl || variants.find((v) => v.resolvedImageUrl)?.resolvedImageUrl || null;
 
+    // product_type/tags drive this store's real collections (mostly smart
+    // collections keyed on vendor or tags, confirmed against live data) —
+    // broadTagFor looks up the matching UPPERCASE category tag for
+    // whatever specific type the extraction call chose (shopifyTaxonomy.js).
+    const broadTag = broadTagFor(item.shopifyProductType);
+    const tags = [broadTag, item.shopifyProductType, item.brand].filter(Boolean);
+
     const shopifyResult = await createDraftProduct({
       title: item.title,
+      category: item.shopifyProductType || item.category,
       specs: research.specs,
       brand: item.brand || undefined,
       variantOptionName: item.variantOptionName || null,
       variants,
       imageUrl: fallbackImageUrl,
+      tags,
     });
 
     // Attach each variant's own resolved image (document- or web-sourced)
@@ -633,7 +658,14 @@ async function drainProductImportQueue() {
     const result = await processItem(item, batch);
     if (result.kind === "drafted") tally.drafted.push({ title: result.title, token: result.token });
     else if (result.kind === "linked") tally.linked += 1;
-    else tally.failed += 1;
+    // already_drafted isn't a failure — it's counted in processedItems
+    // below (processedThisTick counts every item regardless of kind), just
+    // not in any of the drafted/linked/failed buckets specifically. No
+    // batch-level counter for it yet (informational, not actionable —
+    // visible per-item via ImportItemStatus.ALREADY_DRAFTED).
+    else if (result.kind === "already_drafted") {
+      // no-op
+    } else tally.failed += 1;
   });
 
   for (const [batchId, tally] of perBatchTally) {

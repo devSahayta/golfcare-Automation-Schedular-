@@ -33,6 +33,7 @@
 // separate single-variant products.
 
 const Anthropic = require("@anthropic-ai/sdk");
+const { VOCABULARY } = require("../shopifyTaxonomy");
 
 const MODEL = "claude-sonnet-4-6";
 const SONNET_RATE = { inputPerMtok: 3, outputPerMtok: 15 };
@@ -43,15 +44,18 @@ const MAX_OUTPUT_TOKENS = 8192;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+const PRODUCT_TYPE_VOCABULARY = VOCABULARY.map(([type]) => type).join(", ");
+
 const SYSTEM_PROMPT = `You are extracting a structured product list from a raw, messy price-catalog document (text extracted from a PDF — spacing and line breaks may be imperfect). Some of what you're shown also includes the document's own real product photos, each clearly labeled with the page and an image index it belongs to (e.g. "[Page 3, Image 0]") — use those when deciding each variant's documentImageIndex.
 
 Respond with ONLY a JSON array, no other text, no markdown code fences:
-[{"title": "...", "brand": "..." or null, "category": "..." or null, "variantOptionName": "Color" or "Size" or null, "variants": [{"value": "..." or null, "sku": "..." or null, "mrp": 1234, "documentImageIndex": 0 or null}]}, ...]
+[{"title": "...", "brand": "..." or null, "category": "..." or null, "productType": "..." or null, "variantOptionName": "Color" or "Size" or null, "variants": [{"value": "..." or null, "sku": "..." or null, "mrp": 1234, "documentImageIndex": 0 or null}]}, ...]
 
 Rules:
 - One array entry = ONE PRODUCT, which may have several real variants (color/size) — NOT one entry per SKU/article number. If the SAME base product appears multiple times differing only by color or size (e.g. a belt listed 4 times, same name, different article number per color), that is ONE entry with 4 entries in its "variants" array — do not create 4 separate products for it.
 - title: the base product name only — no color/size baked in (that belongs in each variant's "value", not the title).
 - category: a short general product-type label inferred from the document's own structure — usually a section heading (e.g. "Bags", "Headwear", "Apparel", "Accessories", "Balls", "Gloves"). Keep it short and generic (a type of product, not a specific model name); null if genuinely not inferable.
+- productType: pick the CLOSEST match from this store's real existing product types: ${PRODUCT_TYPE_VOCABULARY}. This store has its own conventions that don't always match what you'd guess — e.g. a polo shirt is classified "T-Shirts" here, not "Polos"; pants are "Trousers", not "Pants". Match by what the product actually IS, not by the document's own wording. If genuinely nothing in that list fits well, use your own short, specific, Title Case label instead (e.g. "Rain Jackets") rather than forcing a bad match — never leave it null just because nothing in the list fits exactly; only use null if you can't tell what kind of product this even is.
 - variantOptionName: the ONE dimension that distinguishes the variants ("Color" or "Size" are the common cases) — null if the product has only one variant (variants array will have exactly 1 entry, with value: null).
 - Each entry in variants needs its own mrp. value is the color/size word for that variant (null if variantOptionName is null). sku is that specific variant's own article/SKU/product code if the document gives one, else null — do NOT invent or share a SKU across variants that don't each have their own in the source text.
 - documentImageIndex: if you were shown real product photos for this page and one of them is CONFIDENTLY this specific variant's own photo (not a logo, not a banner, not a different variant's photo, not just "a photo from this page"), set it to that image's index. If you weren't shown any images, aren't confident which photo (if any) is this variant's, or the page's images are all decorative (brand logos, section dividers, cover/thank-you slides), set it to null — never guess. When a page shows several colors of one product, match each color to its OWN best photo, not the same index for all of them. When a page shows several angle-shots of a single-variant product, pick the one clearest index for that one variant.
@@ -132,6 +136,7 @@ function parseSegmentResponse(text) {
       title: p?.title,
       brand: p?.brand || null,
       category: p?.category || null,
+      productType: p?.productType || null,
       variantOptionName: p?.variantOptionName || null,
       variants: (Array.isArray(p?.variants) ? p.variants : [])
         .filter((v) => v?.mrp != null && !Number.isNaN(Number(v.mrp)))
@@ -179,7 +184,7 @@ async function runSegment(content) {
  *        or returns URLs, only bytes in and indices out.
  * @param {string} [input.documentText]
  *        Legacy text-only mode, used only when `pages` isn't given.
- * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number}>}
+ * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, productType:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number}>}
  */
 async function extractBulkCatalogItems({ pages, documentText }) {
   const segments = Array.isArray(pages) && pages.length > 0 ? splitIntoPageBatches(pages) : null;

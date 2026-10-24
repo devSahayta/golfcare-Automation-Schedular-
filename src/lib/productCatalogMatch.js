@@ -89,4 +89,68 @@ async function findExistingCatalogMatch({ title, sku, variantOptions }) {
   return { product, variant: variantScored[0].variant };
 }
 
-module.exports = { findExistingCatalogMatch };
+// Catches the gap findExistingCatalogMatch can't: a product that's been
+// SUBMITTED (one-by-one chat flow or an earlier bulk batch) but not yet
+// approved/published, so it has no Product/Variant row to match against
+// yet, even though a real ProductDraft already exists for it. Confirmed
+// live: the same item got drafted twice, a day apart, once via each flow.
+// Scoped across ALL suppliers (not just the one submitting now) — "already
+// present" shouldn't depend on who sent it first. PENDING and APPROVED
+// both count as "already present"; REJECTED/EXPIRED are excluded on
+// purpose so a resubmission after either of those can go through fresh.
+// Same tokenize/scoring thresholds as findExistingCatalogMatch above, for
+// consistency rather than a third matching style — fetches all
+// PENDING/APPROVED rows (now indexed on approvalStatus) and scores in JS,
+// since rawPayload is a Json column with no efficient DB-side text search.
+/**
+ * @param {object} input
+ * @param {string} input.title
+ * @param {string} [input.sku]
+ * @returns {Promise<{draftId: string} | null>}
+ */
+async function findPendingDraftMatch({ title, sku }) {
+  const drafts = await prisma.productDraft.findMany({
+    where: { approvalStatus: { in: ["PENDING", "APPROVED"] } },
+    select: { id: true, rawPayload: true },
+  });
+  if (drafts.length === 0) return null;
+
+  if (sku) {
+    const skuLower = sku.toLowerCase();
+    const bySku = drafts.find((d) => {
+      const p = d.rawPayload || {};
+      if ((p.sku || "").toLowerCase() === skuLower) return true;
+      return (Array.isArray(p.variants) ? p.variants : []).some(
+        (v) => (v.sku || "").toLowerCase() === skuLower,
+      );
+    });
+    if (bySku) return { draftId: bySku.id };
+  }
+
+  const titleTokens = tokenize(title);
+  if (titleTokens.length === 0) return null;
+
+  const scored = drafts
+    .map((d) => {
+      const draftTitle = d.rawPayload?.title || "";
+      const draftTokens = new Set(tokenize(draftTitle));
+      const overlap = titleTokens.filter((t) => draftTokens.has(t)).length;
+      return { draft: d, score: overlap / titleTokens.length };
+    })
+    .filter((s) => s.score >= 0.6)
+    .sort((a, b) => b.score - a.score);
+
+  if (scored.length === 0) return null;
+  // Deliberately NO dominance-gap tie-break here, unlike findExistingCatalogMatch
+  // above — that check exists to avoid confidently picking between two
+  // DIFFERENT real products that happen to score similarly, where picking
+  // wrong means silently updating the wrong product's stock. Here, a tie
+  // just means several pending drafts already match this title (confirmed
+  // real case: the same item got drafted twice) — any one of them is a
+  // valid "this already exists" signal, so a tie is if anything stronger
+  // evidence to block, never a reason to give up and create yet another.
+
+  return { draftId: scored[0].draft.id };
+}
+
+module.exports = { findExistingCatalogMatch, findPendingDraftMatch };

@@ -205,6 +205,8 @@ async function importAllProducts() {
  * @param {string} [input.imageUrl]
  * @param {string|null} [input.variantOptionName] - e.g. "Color"/"Size", null for a single-variant product
  * @param {{value: string|null, sku: string|null, mrp: number}[]} input.variants - at least one entry
+ * @param {string[]} [input.tags] - e.g. ["APPARELS", "Belts", "Adidas"] — joined into Shopify's
+ *        comma-separated tags string (a plain string field on Shopify's REST product, not an array)
  * @returns {Promise<{shopifyProductId: string, variantResults: {shopifyVariantId: string, mrp: number}[], handle: string, imageIncluded: boolean}>}
  */
 async function createDraftProduct({
@@ -215,6 +217,7 @@ async function createDraftProduct({
   imageUrl,
   variantOptionName,
   variants,
+  tags,
 }) {
   const accessToken = await getValidAccessToken();
   const client = axios.create({
@@ -240,6 +243,7 @@ async function createDraftProduct({
       product_type: category || undefined,
       vendor: brand || undefined,
       status: "draft",
+      ...(tags && tags.length ? { tags: tags.join(", ") } : {}),
       ...(variantOptionName ? { options: [{ name: variantOptionName }] } : {}),
       variants: shopifyVariants,
       ...(withImage && imageUrl ? { images: [{ src: imageUrl }] } : {}),
