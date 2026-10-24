@@ -436,6 +436,8 @@ model ProductDraft {
   emailSentAt           DateTime?           @db.Timestamptz(6)
   createdAt             DateTime            @default(now()) @db.Timestamptz(6)
   Supplier              Supplier?           @relation(fields: [supplierId], references: [id], onUpdate: NoAction, map: "fk_productdraft_supplier")
+
+  @@index([approvalStatus])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -499,6 +501,11 @@ enum ImportItemStatus {
   // picked up by the drain loop (which only queries PENDING); sits here
   // until a human resolves it. Counted in ProductImportBatch.needsRateCount.
   NEEDS_RATE
+  // A PENDING or APPROVED ProductDraft already exists for this item
+  // (findPendingDraftMatch, productCatalogMatch.js) — distinct from
+  // LINKED_EXISTING (a live, Shopify-synced catalog match). resultProductDraftId
+  // points at that existing draft for traceability.
+  ALREADY_DRAFTED
 }
 
 // A supplier sending a large catalog/price list (many new products at
@@ -546,6 +553,14 @@ model ProductImportItem {
   // Inferred from the document's own section structure — used only to
   // resolve this item's rate rule against ProductImportBatch.rateRules.
   category               String?
+  // A more specific Shopify product_type classification (e.g. "Belts",
+  // "T-Shirts", "Stand Bags") — chosen by the extraction call from this
+  // store's REAL existing product_type vocabulary (shopifyTaxonomy.js),
+  // separate from `category` above on purpose: `category` drives
+  // rate-rule matching against what the supplier said in chat and must
+  // keep meaning that broad thing; this field exists purely to set
+  // Shopify's product_type/tags correctly.
+  shopifyProductType     String?
   mrp                    Decimal
   marginPercent          Decimal?
   gstPercent             Decimal?
