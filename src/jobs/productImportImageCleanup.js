@@ -14,7 +14,7 @@ const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
 
 const BUCKET = "product-import-images";
-const MAX_AGE_DAYS = 2;
+const MAX_AGE_DAYS = 0.001;
 const MAX_AGE_MS = MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 
 function getSupabase() {
