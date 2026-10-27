@@ -6,7 +6,6 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
-
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model AuditLog {
   id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -107,7 +106,9 @@ model Conversation {
   Supplier           Supplier?            @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
   Message            Message[]
   OnboardingResponse OnboardingResponse[]
-  AgentUsage         AgentUsage[]
+    AgentUsage         AgentUsage[]
+  totalCostUsd       Float        @default(0)
+  totalCostInr       Float        @default(0)
 
   @@index([customerId], map: "idx_conversation_customer")
   @@index([waPhone], map: "idx_conversation_wa_phone")
@@ -182,6 +183,8 @@ model Customer {
   GolferProfile         GolferProfile?
   OnboardingResponse    OnboardingResponse[]
   Order                 Order[]
+  consentVersion        String?
+  BroadcastRecipient BroadcastRecipient[] 
 
   @@index([waPhone], map: "idx_customer_wa_phone")
 }
@@ -247,8 +250,7 @@ model DynamicTemplate {
   // none locally), never an AI-generated one — same "never show a
   // customer something unverified as fact" principle as Module 5.2's
   // product-onboarding image handling. Uploaded to Samvaadik/Meta only
-  // at approval time (see dynamicTemplateController.js's approveTemplate
-  // in the backend repo).
+  // at approval time (see dynamicTemplateController.js's approveTemplate).
   imageUrl               String?
   CampaignSend           CampaignSend[]
   CampaignTrigger        CampaignTrigger?   @relation(fields: [campaignTriggerId], references: [id], onUpdate: NoAction)
@@ -270,10 +272,15 @@ model Event {
   @@index([customerId, type, occurredAt], map: "idx_event_customer_type_occurred")
 }
 
-/// Duplicated from golfcare-backend's schema.prisma for the same
-/// cross-repo reason as lib/shopifyInventory.js (separate deployable,
-/// can't require() across repos). Backs shopifySyncQueueDrain.js — see
-/// that file's header for what it does.
+/// Backs the scheduler's Shopify-sync drain job — a bulk operation (e.g.
+/// confirm_all_pending_items in supplierAgentTools.js) can skip the
+/// inline Shopify inventory write for variants beyond its per-request
+/// cap (each write is 2-3 Admin API calls; doing thousands inline risks a
+/// serverless timeout and Shopify rate limits). Golf Care OS's own
+/// AvailabilityState is already correct at that point — this table is
+/// only "which variants still need their Shopify inventory level pushed,"
+/// drained gradually and rate-limit-safely by a persistent scheduler
+/// process instead of the request that created the backlog.
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model ShopifySyncQueue {
   id          String       @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -309,6 +316,8 @@ model GolferProfile {
   currentDriver    String?
   currentIronSet   String?
   currentBallBrand String?
+  currentBallModel String?
+  budgetTierSource TierSource?
   bagType          String?
   preferredBrands  String[]    @default([])
   budgetTier       BudgetTier?
@@ -419,6 +428,36 @@ model Product {
   @@index([shopifyProductId], map: "idx_product_shopify_id")
 }
 
+/// Tracks a new product the supplier mentioned that hasn't been turned
+/// into a real ProductDraft yet — usually because required info (margin/
+/// GST) is still being gathered across a couple of WhatsApp turns. Exists
+/// so the agent (and a guardrail) can reliably know "is something still
+/// outstanding here" instead of relying on its own memory of the
+/// conversation — confirmed live, that trust was misplaced: the agent
+/// told a supplier four different new products were "created and live"
+/// across two separate replies without ever once calling
+/// create_product_draft for any of them. Deliberately separate from
+/// ProductDraft (which requires a real approvalToken/tokenExpiresAt and
+/// represents something that actually exists in Shopify) rather than
+/// overloading that table with a pre-creation "still gathering info" state.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model PendingProductLead {
+  id             String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  conversationId String
+  supplierId     String
+  title          String
+  sku            String?
+  mrp            Decimal?  @db.Decimal
+  marginPercent  Decimal?  @db.Decimal
+  gstPercent     Decimal?  @db.Decimal
+  leadTimeDays   Int?
+  status         String    @default("PENDING")
+  createdAt      DateTime  @default(now()) @db.Timestamptz(6)
+  resolvedAt     DateTime? @db.Timestamptz(6)
+
+  @@index([conversationId, status], map: "idx_pendingproductlead_conversation_status")
+}
+
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model ProductDraft {
   id                    String              @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -455,11 +494,16 @@ model Segment {
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model StaffUser {
   id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  kindeUserId String?   @unique
   email     String    @unique
   name      String
   role      StaffRole @default(STAFF)
   isActive  Boolean   @default(true)
   createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  InsightsUsage InsightsUsage[]
+  totalInsightsCostUsd Decimal @default(0) @db.Decimal(10, 6)
+  totalInsightsCostInr Decimal @default(0) @db.Decimal(10, 4)
+  BroadcastCampaign BroadcastCampaign[]
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -607,6 +651,7 @@ model SupplierCheck {
   Supplier    Supplier    @relation(fields: [supplierId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([supplierId], map: "idx_suppliercheck_supplier")
+  @@index([status, sentAt])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -646,6 +691,104 @@ model Variant {
   Product           Product            @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([productId], map: "idx_variant_product")
+}
+
+model InsightsUsage {
+  id            String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  staffUserId   String?
+  question      String
+  model         String?
+  inputTokens   Int       @default(0)
+  outputTokens  Int       @default(0)
+  costUsd       Decimal   @default(0) @db.Decimal(10, 6)
+  costInr       Decimal   @default(0) @db.Decimal(10, 4)
+  toolCallCount Int       @default(0)
+  outcome       String
+  createdAt     DateTime  @default(now()) @db.Timestamptz(6)
+
+  StaffUser     StaffUser? @relation(fields: [staffUserId], references: [id])
+
+  @@index([staffUserId])
+  @@index([createdAt])
+}
+
+model BroadcastCampaign {
+  id                  String             @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name                String
+  status              BroadcastStatus    @default(DRAFT)
+  createdByStaffId    String?
+  agentPrompt         String?
+  audienceRules       Json
+  audienceSize        Int                @default(0)
+  templateName        String             @unique
+  category            TemplateCategory   @default(MARKETING)
+  bodyText            String
+  headerImageUrl      String?
+  samvaadikWtId       String?
+  metaStatus          MetaTemplateStatus @default(NOT_SUBMITTED)
+  metaSubmittedAt     DateTime?          @db.Timestamptz(6)
+  metaApprovedAt      DateTime?          @db.Timestamptz(6)
+  metaRejectionReason String?
+  confirmedAt         DateTime?          @db.Timestamptz(6)
+  scheduledFor        DateTime?          @db.Timestamptz(6)
+  sentCount           Int                @default(0)
+  failedCount         Int                @default(0)
+  skippedCount        Int                @default(0)
+  completedAt         DateTime?          @db.Timestamptz(6)
+  deleteAfter         DateTime?          @db.Timestamptz(6)
+  deleteStatus        DeleteStatus       @default(NOT_DUE)
+  deletedAt           DateTime?          @db.Timestamptz(6)
+  createdAt           DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime           @default(now()) @updatedAt @db.Timestamptz(6)
+  StaffUser           StaffUser?         @relation(fields: [createdByStaffId], references: [id], onUpdate: NoAction)
+  BroadcastRecipient  BroadcastRecipient[]
+  headerType          String?            @default("NONE")
+  headerText          String?
+  footerText          String?
+  buttons             Json?              @default("[]")
+  imageDeletedAt      DateTime?          @db.Timestamptz(6)
+
+  @@index([status], map: "idx_broadcastcampaign_status")
+}
+
+model BroadcastRecipient {
+  id                String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  campaignId        String
+  customerId        String
+  phone             String
+  firstName         String?
+  status            RecipientStatus   @default(PENDING)
+  samvaadikSmId     String?
+  waMessageId       String?
+  skipReason        String?
+  errorMessage      String?
+  sentAt            DateTime?         @db.Timestamptz(6)
+  createdAt         DateTime          @default(now()) @db.Timestamptz(6)
+  BroadcastCampaign BroadcastCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Customer          Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([campaignId, customerId])
+  @@index([campaignId, status], map: "idx_broadcastrecipient_campaign_status")
+}
+
+enum BroadcastStatus {
+  DRAFT
+  SUBMITTED
+  READY
+  SCHEDULED
+  COMPLETED
+  REJECTED
+  CANCELLED
+  FAILED
+  PENDING_SCHEDULE
+}
+
+enum RecipientStatus {
+  PENDING
+  SCHEDULED
+  SENT
+  FAILED
+  SKIPPED
 }
 
 enum ActorType {
@@ -816,4 +959,8 @@ enum TriggerStatus {
   TEMPLATE_CREATED
   SUPPRESSED
   SENT
+}
+enum TierSource {
+  DECLARED
+  REVEALED
 }
