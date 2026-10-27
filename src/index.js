@@ -32,8 +32,11 @@ const {
   registerProductImportImageCleanupJob,
 } = require("./jobs/productImportImageCleanup");
 
-console.log("Golf Care OS scheduler starting...");
+const {
+  registerBroadcastSchedulePollJob,
+} = require("./jobs/broadcastSchedulePoll");
 
+console.log("Golf Care OS scheduler starting...");
 registerAvailabilityDecayJob();
 registerSupplierCheckDispatchJob();
 registerCampaignTriggerEvalJob();
@@ -47,5 +50,6 @@ registerShopifySyncQueueDrainJob();
 registerProductImportDrainJob();
 registerCampaignImageCleanupJob();
 registerProductImportImageCleanupJob();
+registerBroadcastSchedulePollJob();
 
 console.log("Golf Care OS scheduler: all jobs registered.");
