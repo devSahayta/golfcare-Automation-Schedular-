@@ -27,7 +27,7 @@ function plural(n) {
   return n === 1 ? "" : "s";
 }
 
-function buildBody({ supplierName, draftedCount, linkedCount, needsRateCount }) {
+function buildBody({ supplierName, draftedCount, linkedCount, needsRateCount, needsBrandReviewCount }) {
   const lines = [
     `Hi ${supplierName}! Your product list is done processing ✅`,
     "",
@@ -40,6 +40,13 @@ function buildBody({ supplierName, draftedCount, linkedCount, needsRateCount }) 
     // so this doesn't ask them to reply, just sets the expectation.
     lines.push(`${needsRateCount} item${plural(needsRateCount)} on hold, waiting on margin/GST info — we'll follow up on pricing for those`);
   }
+  if (needsBrandReviewCount > 0) {
+    // Also informational only, same reasoning — deliberately doesn't name
+    // which brand(s) here or imply the supplier did anything wrong; this
+    // is a "we need to confirm something on our side" message, not an
+    // accusation.
+    lines.push(`${needsBrandReviewCount} item${plural(needsBrandReviewCount)} on hold — we're confirming brand details for your account, we'll follow up`);
+  }
   lines.push("", "Thanks for sending the list!");
   return lines.join("\n");
 }
@@ -50,9 +57,10 @@ function buildBody({ supplierName, draftedCount, linkedCount, needsRateCount }) 
  * @param {number} input.draftedCount
  * @param {number} input.linkedCount
  * @param {number} input.needsRateCount
+ * @param {number} [input.needsBrandReviewCount]
  */
-async function sendBulkImportCompletionMessage({ supplier, draftedCount, linkedCount, needsRateCount }) {
-  const body = buildBody({ supplierName: supplier.name, draftedCount, linkedCount, needsRateCount });
+async function sendBulkImportCompletionMessage({ supplier, draftedCount, linkedCount, needsRateCount, needsBrandReviewCount = 0 }) {
+  const body = buildBody({ supplierName: supplier.name, draftedCount, linkedCount, needsRateCount, needsBrandReviewCount });
 
   await sendText(supplier.waPhone, body);
 

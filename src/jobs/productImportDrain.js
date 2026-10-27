@@ -142,6 +142,7 @@ async function extractPendingBatch() {
   const batch = await prisma.productImportBatch.findFirst({
     where: { status: "PENDING_EXTRACTION" },
     orderBy: { createdAt: "asc" },
+    include: { Supplier: true },
   });
   if (!batch) return null;
 
@@ -204,11 +205,32 @@ async function extractPendingBatch() {
     // once — nothing downstream (processItem, etc.) needs to know rates
     // ever varied by brand/category, it just reads the already-resolved
     // value off the row.
+    const supplierBrands = batch.Supplier?.brands || [];
     const cleanItems = items
       .filter((i) => Array.isArray(i.variants) && i.variants.length > 0)
       .slice(0, MAX_ITEMS_PER_BATCH)
       .map((i) => {
-        const rate = resolveRate(batch.rateRules, i);
+        // Brand authorization takes priority over rate-resolution — no
+        // point resolving a margin/GST rate for an item that's going to be
+        // held back regardless. A supplier should only ever draft brands
+        // on their own Supplier.brands list; an unidentified brand is
+        // treated the same as a disallowed one (never assume it's fine
+        // just because we can't tell).
+        const brandAllowed = i.brand && supplierBrands.some((b) => b.toLowerCase() === i.brand.toLowerCase());
+        const rate = brandAllowed ? resolveRate(batch.rateRules, i) : null;
+
+        let status = "PENDING";
+        let errorMessage = null;
+        if (!brandAllowed) {
+          status = "NEEDS_BRAND_REVIEW";
+          errorMessage = i.brand
+            ? `Brand "${i.brand}" is not in this supplier's allowed brands list.`
+            : "No brand could be identified for this item.";
+        } else if (!rate) {
+          status = "NEEDS_RATE";
+          errorMessage = "No margin/GST rate rule matched this item's brand/category.";
+        }
+
         return {
           batchId: batch.id,
           title: i.title,
@@ -221,11 +243,13 @@ async function extractPendingBatch() {
           gstPercent: rate?.gstPercent ?? null,
           variantOptionName: i.variantOptionName || null,
           variantOptions: i.variants,
-          status: rate ? "PENDING" : "NEEDS_RATE",
-          // NEEDS_RATE items are already "done" from the drain loop's
-          // perspective (it only ever queries PENDING) — processedAt now
-          // marks that explicitly rather than leaving it looking stuck.
-          processedAt: rate ? null : new Date(),
+          status,
+          errorMessage,
+          // NEEDS_RATE/NEEDS_BRAND_REVIEW items are already "done" from the
+          // drain loop's perspective (it only ever queries PENDING) —
+          // processedAt now marks that explicitly rather than leaving it
+          // looking stuck.
+          processedAt: status === "PENDING" ? null : new Date(),
         };
       });
 
@@ -238,18 +262,21 @@ async function extractPendingBatch() {
     }
 
     const needsRateCount = cleanItems.filter((i) => i.status === "NEEDS_RATE").length;
+    const needsBrandReviewCount = cleanItems.filter((i) => i.status === "NEEDS_BRAND_REVIEW").length;
     await prisma.productImportItem.createMany({ data: cleanItems });
     await prisma.productImportBatch.update({
       where: { id: batch.id },
       data: {
         totalItems: cleanItems.length,
-        processedItems: needsRateCount,
+        processedItems: needsRateCount + needsBrandReviewCount,
         needsRateCount,
+        needsBrandReviewCount,
         status: "PROCESSING",
       },
     });
-    // No-ops unless EVERY item came back NEEDS_RATE (nothing PENDING for
-    // the normal drain loop to ever reach this batch through) — see
+    // No-ops unless EVERY item came back NEEDS_RATE/NEEDS_BRAND_REVIEW
+    // (nothing PENDING for the normal drain loop to ever reach this batch
+    // through) — see
     // finalizeBatchIfComplete's own comment.
     await finalizeBatchIfComplete(batch.id);
     return { batchId: batch.id, extracted: cleanItems.length, needsRate: needsRateCount };
@@ -606,6 +633,11 @@ async function finalizeBatchIfComplete(batchId) {
     select: { title: true, brand: true, category: true },
   });
 
+  const needsBrandReviewItems = await prisma.productImportItem.findMany({
+    where: { batchId, status: "NEEDS_BRAND_REVIEW" },
+    select: { title: true, brand: true, category: true },
+  });
+
   const supplier = await prisma.supplier.findUnique({ where: { id: updated.supplierId } });
   try {
     await sendBulkImportDigestEmail({
@@ -615,6 +647,7 @@ async function finalizeBatchIfComplete(batchId) {
       linkedCount: updated.linkedCount,
       failedCount: updated.failedCount,
       needsRateItems,
+      needsBrandReviewItems,
     });
   } catch (err) {
     console.error(`[job] productImportDrain: digest email failed for batch ${batchId}:`, err.message);
@@ -627,6 +660,7 @@ async function finalizeBatchIfComplete(batchId) {
         draftedCount: draftedItems.length,
         linkedCount: updated.linkedCount,
         needsRateCount: needsRateItems.length,
+        needsBrandReviewCount: needsBrandReviewItems.length,
       });
     } catch (err) {
       console.error(`[job] productImportDrain: supplier completion message failed for batch ${batchId}:`, err.message);
