@@ -550,6 +550,11 @@ enum ImportItemStatus {
   // LINKED_EXISTING (a live, Shopify-synced catalog match). resultProductDraftId
   // points at that existing draft for traceability.
   ALREADY_DRAFTED
+  // This item's brand isn't in the supplier's own Supplier.brands list (or
+  // no brand could be confidently identified at all) — held back for a
+  // human to confirm/update the supplier's brand list. Counted in
+  // ProductImportBatch.needsBrandReviewCount.
+  NEEDS_BRAND_REVIEW
 }
 
 // A supplier sending a large catalog/price list (many new products at
@@ -569,6 +574,8 @@ model ProductImportBatch {
   linkedCount     Int               @default(0)
   failedCount     Int               @default(0)
   needsRateCount  Int               @default(0)
+  // See ImportItemStatus.NEEDS_BRAND_REVIEW.
+  needsBrandReviewCount Int         @default(0)
   status          ImportBatchStatus @default(PENDING_EXTRACTION)
   rawDocumentText String?
   // The original WhatsApp attachment's own Message.mediaUrl, captured at
