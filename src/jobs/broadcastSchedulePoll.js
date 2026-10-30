@@ -148,6 +148,25 @@ async function fanOutApprovedCampaign(campaign, requestedSendAt) {
     sendAt = effectiveSendAt;
   }
 
+  // Atomic claim — prevents a double-send if this campaign is ever polled
+  // by two overlapping schedulers at once (two processes pointed at the
+  // same DB, e.g. a local scheduler left running alongside the Render
+  // deployment, or two Render instances). The isRunning flag below only
+  // guards against overlap within a single process; this guards against
+  // overlap across processes. Postgres serializes the two concurrent
+  // UPDATEs — whichever commits first flips the status, so the second
+  // one's WHERE clause no longer matches and `count` comes back 0.
+  const claim = await prisma.broadcastCampaign.updateMany({
+    where: { id: campaign.id, status: campaign.status },
+    data: { status: "SCHEDULED", scheduledFor: sendAt },
+  });
+  if (claim.count === 0) {
+    console.log(
+      `[job] broadcastSchedulePoll: campaign ${campaign.id} already claimed by another poll tick — skipping duplicate fan-out.`,
+    );
+    return;
+  }
+
   const recipients = await prisma.broadcastRecipient.findMany({
     where: { campaignId: campaign.id, status: "PENDING" },
     select: { id: true, phone: true, firstName: true, customerId: true },
@@ -198,11 +217,7 @@ async function fanOutApprovedCampaign(campaign, requestedSendAt) {
 
   await prisma.broadcastCampaign.update({
     where: { id: campaign.id },
-    data: {
-      status: "SCHEDULED",
-      scheduledFor: sendAt,
-      skippedCount: skipped.length,
-    },
+    data: { skippedCount: skipped.length },
   });
   await writeAudit(
     "AGENT_SCHEDULE_FAN_OUT_STARTED",
@@ -312,17 +327,22 @@ async function pollBroadcastApprovals() {
       } else {
         // Plain SUBMITTED, no agent-requested time — staff still picks
         // "Send now" / "Schedule for later" from the dashboard themselves.
-        await prisma.broadcastCampaign.update({
-          where: { id: campaign.id },
+        // Same atomic-claim reasoning as fanOutApprovedCampaign above —
+        // otherwise two overlapping schedulers both flip this to READY
+        // and both write an audit row.
+        const readyClaim = await prisma.broadcastCampaign.updateMany({
+          where: { id: campaign.id, status: "SUBMITTED" },
           data: { status: "READY" },
         });
-        await writeAudit(
-          "META_APPROVED",
-          campaign.id,
-          { status: "SUBMITTED" },
-          { status: "READY" },
-        );
-        advanced += 1;
+        if (readyClaim.count > 0) {
+          await writeAudit(
+            "META_APPROVED",
+            campaign.id,
+            { status: "SUBMITTED" },
+            { status: "READY" },
+          );
+          advanced += 1;
+        }
       }
     } else if (status.status === "REJECTED") {
       await prisma.broadcastCampaign.update({
