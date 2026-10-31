@@ -53,10 +53,20 @@ async function sendText(to, body, options = {}) {
  * accepts, so this deliberately differs from an earlier draft signature.
  * Pass them in order, e.g. ["Rahul", "Order #123"].
  *
+ * NOTE ON `options.buttonParameters`: separate from the body's `variables`
+ * — this fills a dynamic URL button's own {{1}} (a template can have a URL
+ * button whose url ends in a {{1}} placeholder, independent of the body's
+ * own {{1}}/{{2}}/...). Confirmed against Samvaadik's real source
+ * (publicApiController.js, Oct 2026): one value per dynamic URL button, in
+ * the order Samvaadik finds them on the template — for the common
+ * one-button case this is just a 1-element array, e.g. [supplier.portalToken].
+ * Required if the template has a dynamic URL button; omit entirely for a
+ * template with only static buttons (or none).
+ *
  * @param {string} to
  * @param {string} templateName
  * @param {string[]} [variables] - ordered body parameters
- * @param {{ language?: string, headerMediaId?: string }} [options]
+ * @param {{ language?: string, headerMediaId?: string, buttonParameters?: string[] }} [options]
  * @returns {Promise<{ waMessageId: string, wmId: string }>}
  */
 async function sendTemplate(to, templateName, variables = [], options = {}) {
@@ -67,6 +77,7 @@ async function sendTemplate(to, templateName, variables = [], options = {}) {
       language: options.language || "en_US",
       parameters: variables,
       ...(options.headerMediaId && { header_media_id: options.headerMediaId }),
+      ...(options.buttonParameters && { button_parameters: options.buttonParameters }),
     });
     return { waMessageId: res.data.wa_message_id, wmId: res.data.wm_id };
   });

@@ -89,10 +89,21 @@ async function sendCheckinOpener(supplier, itemCount, { isReminder = false } = {
       `${isReminder ? "SUPPLIER_CHECKIN_REMINDER_TEMPLATE_NAME/" : ""}SUPPLIER_CHECKIN_TEMPLATE_NAME is not configured`,
     );
   }
-  // Assumed template shape: {{1}} = supplier name, {{2}} = item count.
-  // Whoever creates the actual approved template in Samvaadik should
-  // match this parameter order, or this call needs updating to match.
-  return sendTemplate(supplier.waPhone, templateName, [supplier.name, String(itemCount)]);
+  if (!supplier.portalToken) {
+    // Every supplier created through the dashboard gets one at creation
+    // time (supplierController.js) — this only fires for a supplier that
+    // predates that, or a direct DB row. Fail loud rather than send a
+    // template with a broken button link.
+    throw new Error(`Supplier ${supplier.id} has no portalToken`);
+  }
+  // Template shape: body {{1}} = supplier name, {{2}} = item count; the
+  // portal link is a dynamic URL button on the template itself
+  // (`.../supplier-checkin/{{1}}`, configured in Samvaadik, not built
+  // here) — its {{1}} is a separate placeholder from the body's, filled
+  // via buttonParameters with just the bare token.
+  return sendTemplate(supplier.waPhone, templateName, [supplier.name, String(itemCount)], {
+    buttonParameters: [supplier.portalToken],
+  });
 }
 
 async function dispatchCadenceChecks() {
