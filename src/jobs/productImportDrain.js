@@ -216,15 +216,24 @@ async function extractPendingBatch() {
         // on their own Supplier.brands list; an unidentified brand is
         // treated the same as a disallowed one (never assume it's fine
         // just because we can't tell).
-        const brandAllowed = i.brand && supplierBrands.some((b) => b.toLowerCase() === i.brand.toLowerCase());
-        const rate = brandAllowed ? resolveRate(batch.rateRules, i) : null;
+        //
+        // The document itself doesn't always name a brand per item — a
+        // supplier's own single-brand catalog can just list product names
+        // ("Fineline Polo") with no brand column at all. batch.defaultBrand
+        // is what the supplier told the live agent covers the whole
+        // document in that case (see start_bulk_product_import, backend
+        // repo) — only used when extraction found nothing on the page
+        // itself, never overriding a brand the document actually states.
+        const brand = i.brand || batch.defaultBrand || null;
+        const brandAllowed = brand && supplierBrands.some((b) => b.toLowerCase() === brand.toLowerCase());
+        const rate = brandAllowed ? resolveRate(batch.rateRules, { ...i, brand }) : null;
 
         let status = "PENDING";
         let errorMessage = null;
         if (!brandAllowed) {
           status = "NEEDS_BRAND_REVIEW";
-          errorMessage = i.brand
-            ? `Brand "${i.brand}" is not in this supplier's allowed brands list.`
+          errorMessage = brand
+            ? `Brand "${brand}" is not in this supplier's allowed brands list.`
             : "No brand could be identified for this item.";
         } else if (!rate) {
           status = "NEEDS_RATE";
@@ -235,7 +244,7 @@ async function extractPendingBatch() {
           batchId: batch.id,
           title: i.title,
           sku: i.variants[0].sku || null,
-          brand: i.brand || null,
+          brand,
           category: i.category || null,
           shopifyProductType: i.productType || null,
           mrp: i.variants[0].mrp,

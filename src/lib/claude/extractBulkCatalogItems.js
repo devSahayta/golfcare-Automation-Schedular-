@@ -62,7 +62,7 @@ Rules:
 - If the document gives sizes as a RANGE shared by one article/color (e.g. "S M L XL 2XL" after one price and one SKU) rather than a distinct SKU per size, that's still effectively ONE variant for extraction purposes — set variantOptionName to null and variants to a single entry (the per-size breakdown isn't capturable from a shared SKU+price and would need a human to add real size variants later).
 - Include every row/group that names a real product AND gives it an explicit price (MRP/price in INR). Skip anything with no price — section headers, brand intro text, "thank you" pages, decorative-only lines.
 - mrp: the number only, no currency symbols or commas. If a price looks obviously corrupted (e.g. "8GG0" where digits got OCR'd into letters), never guess the real number — instead drop that one variant (or the whole product if it's the only variant) rather than inventing a figure.
-- brand: the manufacturer/brand name, if identifiable from context (a section header naming the brand applies to the rows under it).
+- brand: the manufacturer/brand name, if identifiable from context (a section header naming the brand applies to the rows under it — including a brand shown only as a logo/wordmark image, with no brand text on the page at all, if you can read it in the image). You may also be given a "Carried-forward brand" note — the last brand established by an earlier page's own header/logo elsewhere in this same document, since a long brand section commonly doesn't repeat its name on every single page. Use it for rows on a page that shows no brand, header, or logo of its own. The moment a page in front of you shows a different or new brand's own header/logo/text, that overrides the carried-forward note — never let it override what's actually on the page.
 - Never include the same variant twice.
 
 If the text segment has no genuine priced product rows at all (e.g. it's pure section-header/thank-you boilerplate), respond with an empty array: []`;
@@ -97,8 +97,14 @@ function splitIntoPageBatches(pages) {
 // base64 (bytes already in hand from pdfImageExtractor.js) rather than
 // fetched by URL — simpler and avoids any inconsistency across SDK
 // versions in URL-sourced image blocks.
-function buildPageBatchContent(pageBatch) {
+function buildPageBatchContent(pageBatch, carryForwardBrand) {
   const content = [];
+  if (carryForwardBrand) {
+    content.push({
+      type: "text",
+      text: `Carried-forward brand: "${carryForwardBrand}" — the last brand established by an earlier page's own header/logo in this document. See the brand rule above for when to use it.`,
+    });
+  }
   for (const page of pageBatch) {
     content.push({
       type: "text",
@@ -195,13 +201,27 @@ async function extractBulkCatalogItems({ pages, documentText }) {
   let segmentCount = 0;
 
   if (segments) {
+    // Each page-batch is its own isolated API call with no memory of any
+    // other batch — confirmed live: a brand named once on a section divider
+    // page (sometimes only as a logo image, no brand text at all) can head
+    // a run of 20+ product pages that never repeat it, spanning several
+    // batches at PAGES_PER_SEGMENT=3. Only the one batch containing the
+    // divider itself would ever see the brand without this. carryForwardBrand
+    // is sticky across batches — it only updates when a batch's own items
+    // actually came back branded, so a batch of brand-less rows (or one the
+    // model missed) doesn't reset it, and a genuinely new section's brand
+    // naturally takes over once the model reads it off that section's own
+    // pages.
+    let carryForwardBrand = null;
     for (const pageBatch of segments) {
-      const content = buildPageBatchContent(pageBatch);
+      const content = buildPageBatchContent(pageBatch, carryForwardBrand);
       const result = await runSegment(content);
       items = items.concat(result.items);
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
       segmentCount++;
+      const lastBrand = [...result.items].reverse().find((it) => it.brand)?.brand;
+      if (lastBrand) carryForwardBrand = lastBrand;
     }
   } else {
     const textSegments = splitIntoCharSegments(documentText || "");
