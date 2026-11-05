@@ -123,6 +123,7 @@ function extractPageImages(doc, page) {
  *     pageNumber: number,
  *     text: string,
  *     images: { index: number, contentHash: string, bytes: Buffer, mimeType: "image/jpeg" }[],
+ *     skippedNonJpeg: number,
  *   }[],
  *   skippedNonJpegImageCount: number,
  * }>}
@@ -145,7 +146,11 @@ async function extractPdfPagesWithImages(pdfBuffer) {
       mimeType: "image/jpeg",
     }));
 
-    return { pageNumber: i + 1, text: texts[i] || "", images };
+    // Carried through so extractBulkCatalogItems.js can tell "this page
+    // genuinely has no brand signal" apart from "this page HAD a logo/image
+    // but it's a format v1 can't decode (see file header)" — the latter
+    // should never be treated the same as a confirmed brand-less page.
+    return { pageNumber: i + 1, text: texts[i] || "", images, skippedNonJpeg };
   });
 
   return { pages, skippedNonJpegImageCount };

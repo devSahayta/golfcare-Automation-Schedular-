@@ -34,7 +34,7 @@ const { extractBulkCatalogItems } = require("../lib/claude/extractBulkCatalogIte
 const { extractPdfPagesWithImages } = require("../lib/pdfImageExtractor");
 const { uploadDocumentImage } = require("../lib/supabaseStorage");
 const { createDraftProduct, addVariantImage } = require("../lib/shopify");
-const { updateInventoryItemCost } = require("../lib/shopifyInventory");
+const { updateInventoryItemCost, setInitialStockQuantity } = require("../lib/shopifyInventory");
 const { computeCostPrice } = require("../lib/pricingCalculator");
 const { sendBulkImportDigestEmail } = require("../lib/email/sendBulkImportDigestEmail");
 const { sendBulkImportCompletionMessage } = require("../lib/sendBulkImportCompletionMessage");
@@ -119,7 +119,12 @@ async function extractPagesWithUploadedImages(batch) {
       }
       renumberedImages.push({ index: globalIndex, mimeType: img.mimeType, bytes: img.bytes });
     }
-    pagesForExtraction.push({ pageNumber: page.pageNumber, text: page.text, images: renumberedImages });
+    pagesForExtraction.push({
+      pageNumber: page.pageNumber,
+      text: page.text,
+      images: renumberedImages,
+      skippedNonJpeg: page.skippedNonJpeg || 0,
+    });
   }
 
   if (skippedNonJpegImageCount > 0) {
@@ -171,6 +176,7 @@ async function extractPendingBatch() {
         value: v.value,
         sku: v.sku,
         mrp: v.mrp,
+        quantity: v.quantity ?? null,
         documentImageUrl: v.documentImageIndex != null ? globalIndexToUrl.get(v.documentImageIndex) || null : null,
       })),
     }));
@@ -322,7 +328,7 @@ async function processItem(item, batch) {
     // from crashing if it ever does.
     const variants = Array.isArray(item.variantOptions) && item.variantOptions.length > 0
       ? item.variantOptions
-      : [{ value: null, sku: item.sku, mrp: Number(item.mrp), documentImageUrl: null }];
+      : [{ value: null, sku: item.sku, mrp: Number(item.mrp), quantity: null, documentImageUrl: null }];
 
     // Duplicate-check against the whole catalog, one probe per variant —
     // if ANY variant matches something that already exists, the simplest
@@ -518,7 +524,7 @@ async function processItem(item, batch) {
     // vary price by size), so cost price is computed per variant, not once
     // for the whole product.
     const variantCostResults = await Promise.all(
-      shopifyResult.variantResults.map(async (vr) => {
+      shopifyResult.variantResults.map(async (vr, idx) => {
         const costPrice = computeCostPrice({
           mrp: vr.mrp,
           marginPercent: Number(item.marginPercent),
@@ -531,6 +537,22 @@ async function processItem(item, batch) {
             costResult.error,
           );
         }
+
+        // Only when the document itself stated this variant's stock count
+        // (see extractBulkCatalogItems.js's `quantity` field) — a variant
+        // with none falls through to the existing untracked-stock behavior
+        // exactly as before this feature existed.
+        const quantity = variants[idx]?.quantity;
+        if (quantity != null) {
+          const stockResult = await setInitialStockQuantity(vr.shopifyVariantId, quantity);
+          if (!stockResult.ok) {
+            console.error(
+              `[job] productImportDrain: Shopify stock sync failed for variant ${vr.shopifyVariantId} on ${shopifyResult.shopifyProductId}:`,
+              stockResult.error,
+            );
+          }
+        }
+
         return { shopifyVariantId: vr.shopifyVariantId, mrp: vr.mrp, costPrice };
       }),
     );

@@ -49,7 +49,7 @@ const PRODUCT_TYPE_VOCABULARY = VOCABULARY.map(([type]) => type).join(", ");
 const SYSTEM_PROMPT = `You are extracting a structured product list from a raw, messy price-catalog document (text extracted from a PDF — spacing and line breaks may be imperfect). Some of what you're shown also includes the document's own real product photos, each clearly labeled with the page and an image index it belongs to (e.g. "[Page 3, Image 0]") — use those when deciding each variant's documentImageIndex.
 
 Respond with ONLY a JSON array, no other text, no markdown code fences:
-[{"title": "...", "brand": "..." or null, "category": "..." or null, "productType": "..." or null, "variantOptionName": "Color" or "Size" or null, "variants": [{"value": "..." or null, "sku": "..." or null, "mrp": 1234, "documentImageIndex": 0 or null}]}, ...]
+[{"title": "...", "brand": "..." or null, "category": "..." or null, "productType": "..." or null, "variantOptionName": "Color" or "Size" or null, "variants": [{"value": "..." or null, "sku": "..." or null, "mrp": 1234, "quantity": 10 or null, "documentImageIndex": 0 or null}]}, ...]
 
 Rules:
 - One array entry = ONE PRODUCT, which may have several real variants (color/size) — NOT one entry per SKU/article number. If the SAME base product appears multiple times differing only by color or size (e.g. a belt listed 4 times, same name, different article number per color), that is ONE entry with 4 entries in its "variants" array — do not create 4 separate products for it.
@@ -58,6 +58,7 @@ Rules:
 - productType: pick the CLOSEST match from this store's real existing product types: ${PRODUCT_TYPE_VOCABULARY}. This store has its own conventions that don't always match what you'd guess — e.g. a polo shirt is classified "T-Shirts" here, not "Polos"; pants are "Trousers", not "Pants". Match by what the product actually IS, not by the document's own wording. If genuinely nothing in that list fits well, use your own short, specific, Title Case label instead (e.g. "Rain Jackets") rather than forcing a bad match — never leave it null just because nothing in the list fits exactly; only use null if you can't tell what kind of product this even is.
 - variantOptionName: the ONE dimension that distinguishes the variants ("Color" or "Size" are the common cases) — null if the product has only one variant (variants array will have exactly 1 entry, with value: null).
 - Each entry in variants needs its own mrp. value is the color/size word for that variant (null if variantOptionName is null). sku is that specific variant's own article/SKU/product code if the document gives one, else null — do NOT invent or share a SKU across variants that don't each have their own in the source text.
+- quantity: if the document states a stock count / quantity-in-hand / qty-available number for this specific variant (separate from its price and from its SKU/article number), extract it as a plain integer. null if the document doesn't give one — never confuse it with price, a SKU, or a size-range listing; never guess or invent a number that isn't actually printed as a quantity.
 - documentImageIndex: if you were shown real product photos for this page and one of them is CONFIDENTLY this specific variant's own photo (not a logo, not a banner, not a different variant's photo, not just "a photo from this page"), set it to that image's index. If you weren't shown any images, aren't confident which photo (if any) is this variant's, or the page's images are all decorative (brand logos, section dividers, cover/thank-you slides), set it to null — never guess. When a page shows several colors of one product, match each color to its OWN best photo, not the same index for all of them. When a page shows several angle-shots of a single-variant product, pick the one clearest index for that one variant.
 - If the document gives sizes as a RANGE shared by one article/color (e.g. "S M L XL 2XL" after one price and one SKU) rather than a distinct SKU per size, that's still effectively ONE variant for extraction purposes — set variantOptionName to null and variants to a single entry (the per-size breakdown isn't capturable from a shared SKU+price and would need a human to add real size variants later).
 - Include every row/group that names a real product AND gives it an explicit price (MRP/price in INR). Skip anything with no price — section headers, brand intro text, "thank you" pages, decorative-only lines.
@@ -106,6 +107,20 @@ function buildPageBatchContent(pageBatch, carryForwardBrand) {
     });
   }
   for (const page of pageBatch) {
+    if (page.skippedNonJpeg > 0) {
+      // Confirmed live: a brand-divider page whose only brand signal is a
+      // stylized logo in a format pdfImageExtractor.js can't decode (v1 is
+      // JPEG-only) was silently invisible to the model, which then applied
+      // the stale carried-forward brand from the PRIOR section to this
+      // page's own products within this very call — mislabeling a whole
+      // new brand's items as the old one. This note makes that gap visible
+      // to the model instead of letting it default to "no new signal, so
+      // keep the old brand."
+      content.push({
+        type: "text",
+        text: `Note: page ${page.pageNumber} contains ${page.skippedNonJpeg} image(s) this system could not display (unsupported format — commonly a stylized brand logo/wordmark on a section-divider page). If this page's own text doesn't name a brand, do NOT assume the carried-forward brand noted above still applies here or on pages after it — treat the brand as unknown until it's actually confirmed in text or a displayable image.`,
+      });
+    }
     content.push({
       type: "text",
       text: `--- PAGE ${page.pageNumber} ---\n${page.text}`,
@@ -132,7 +147,8 @@ function parseSegmentResponse(text) {
   let parsed;
   try {
     parsed = JSON.parse(cleaned);
-  } catch {
+  } catch (err) {
+    console.warn(`[extractBulkCatalogItems] failed to parse segment response as JSON (${err.message}) — treating as empty`);
     return [];
   }
   if (!Array.isArray(parsed)) return [];
@@ -150,6 +166,7 @@ function parseSegmentResponse(text) {
           value: v.value || null,
           sku: v.sku || null,
           mrp: Number(v.mrp),
+          quantity: v.quantity != null && !Number.isNaN(Number(v.quantity)) ? Number(v.quantity) : null,
           documentImageIndex: Number.isInteger(v.documentImageIndex) ? v.documentImageIndex : null,
         })),
     }))
@@ -178,19 +195,66 @@ async function runSegment(content) {
     items: parseSegmentResponse(text),
     inputTokens: response.usage?.input_tokens || 0,
     outputTokens: response.usage?.output_tokens || 0,
+    truncated: response.stop_reason === "max_tokens",
   };
+}
+
+// A page-batch whose response got cut off by MAX_OUTPUT_TOKENS mid-JSON
+// fails parseSegmentResponse's JSON.parse and silently becomes an empty
+// array — indistinguishable from "this page genuinely has nothing", so a
+// dense multi-brand page-batch (several products, each with photo-matched
+// variants) can lose everything in that batch at once with zero signal.
+// Confirmed live: the final 3-page segment of a 105-page catalog, bundling
+// two unusually dense brand pages, came back completely empty this way.
+// Retried here by halving the page-batch and re-running each half as its
+// own call — cheaper pages fit comfortably under the cap on their own, and
+// re-running with fewer pages is the only lever available since the
+// response size is driven by how much is ON the page, not anything tunable
+// per call. Bottoms out at single pages; a single page that still
+// truncates is logged and returned as-is (best-effort partial parse) since
+// there's nothing smaller left to retry with.
+async function runPageBatchWithRetry(pageBatch, carryForwardBrand) {
+  const result = await runSegment(buildPageBatchContent(pageBatch, carryForwardBrand));
+  if (!result.truncated || pageBatch.length === 1) {
+    if (result.truncated) {
+      console.warn(
+        `[extractBulkCatalogItems] page ${pageBatch[0].pageNumber} alone hit max_tokens — response may be incomplete, using what parsed`,
+      );
+    }
+    return result;
+  }
+
+  const mid = Math.ceil(pageBatch.length / 2);
+  const halves = [pageBatch.slice(0, mid), pageBatch.slice(mid)];
+  console.warn(
+    `[extractBulkCatalogItems] segment for pages ${pageBatch.map((p) => p.pageNumber).join(",")} hit max_tokens — retrying as ${halves.map((h) => h.map((p) => p.pageNumber).join("+")).join(" and ")}`,
+  );
+
+  let items = [];
+  let inputTokens = result.inputTokens;
+  let outputTokens = result.outputTokens;
+  let brand = carryForwardBrand;
+  for (const half of halves) {
+    const sub = await runPageBatchWithRetry(half, brand);
+    items = items.concat(sub.items);
+    inputTokens += sub.inputTokens;
+    outputTokens += sub.outputTokens;
+    const lastBrand = [...sub.items].reverse().find((it) => it.brand)?.brand;
+    if (lastBrand) brand = lastBrand;
+  }
+  return { items, inputTokens, outputTokens, truncated: false };
 }
 
 /**
  * @param {object} input
- * @param {{pageNumber:number, text:string, images:{index:number, mimeType?:string, bytes:Buffer}[]}[]} [input.pages]
+ * @param {{pageNumber:number, text:string, images:{index:number, mimeType?:string, bytes:Buffer}[], skippedNonJpeg?:number}[]} [input.pages]
  *        Page-aware mode — each returned variant's documentImageIndex refers
  *        to a page-local image index the CALLER must resolve back to a real
  *        URL (via the same page's `images` list) — this function never sees
  *        or returns URLs, only bytes in and indices out.
  * @param {string} [input.documentText]
  *        Legacy text-only mode, used only when `pages` isn't given.
- * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, productType:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number}>}
+ * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, productType:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, quantity:number|null, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number}>}
  */
 async function extractBulkCatalogItems({ pages, documentText }) {
   const segments = Array.isArray(pages) && pages.length > 0 ? splitIntoPageBatches(pages) : null;
@@ -214,14 +278,27 @@ async function extractBulkCatalogItems({ pages, documentText }) {
     // pages.
     let carryForwardBrand = null;
     for (const pageBatch of segments) {
-      const content = buildPageBatchContent(pageBatch, carryForwardBrand);
-      const result = await runSegment(content);
+      const result = await runPageBatchWithRetry(pageBatch, carryForwardBrand);
       items = items.concat(result.items);
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
       segmentCount++;
       const lastBrand = [...result.items].reverse().find((it) => it.brand)?.brand;
-      if (lastBrand) carryForwardBrand = lastBrand;
+      if (lastBrand) {
+        carryForwardBrand = lastBrand;
+      } else if (result.items.length === 0 && pageBatch.some((p) => (p.skippedNonJpeg || 0) > 0)) {
+        // This batch had an image we couldn't decode (pdfImageExtractor is
+        // JPEG-only — a non-JPEG logo on what's likely a brand-divider page)
+        // and returned no priced rows of its own. Go in unknown for the next
+        // batch rather than keep asserting the OLD section's brand onto
+        // whatever a new, unreadable-logo'd section turns out to be —
+        // confirmed live: without this, a stale brand from several segments
+        // back silently mislabeled an entire new brand's products. If the
+        // supplier named this document's brand in chat, batch.defaultBrand
+        // (applied downstream in productImportDrain.js) covers the gap this
+        // leaves; it's a safer fallback than a confidently wrong carry-over.
+        carryForwardBrand = null;
+      }
     }
   } else {
     const textSegments = splitIntoCharSegments(documentText || "");
