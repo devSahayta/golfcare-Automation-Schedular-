@@ -173,4 +173,34 @@ async function updateInventoryItemCost(shopifyVariantId, cost, { attempts = 2, r
   };
 }
 
-module.exports = { writeAvailabilityToShopify, updateInventoryItemCost };
+// Used by jobs/productImportDrain.js right after creating a bulk-import
+// draft product, for a variant whose document stated a real stock
+// quantity (createDraftProduct's own /products.json call can't reliably
+// set stock — Shopify no longer honors inventory_quantity on variant
+// creation, see the note at that call site — so this is a required
+// follow-up, not optional polish, for any variant with a quantity).
+async function setInitialStockQuantity(shopifyVariantId, quantity, { attempts = 2, retryDelayMs = 500 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const [inventoryItemId, locationId] = await Promise.all([
+        getInventoryItemId(shopifyVariantId),
+        getPrimaryLocationId(),
+      ]);
+      await ensureInventoryTracked(inventoryItemId);
+      await setInventoryLevel(inventoryItemId, locationId, quantity);
+      return { ok: true };
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) {
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+      }
+    }
+  }
+  return {
+    ok: false,
+    error: lastError?.response?.data || lastError?.message || String(lastError),
+  };
+}
+
+module.exports = { writeAvailabilityToShopify, updateInventoryItemCost, setInitialStockQuantity };

@@ -34,7 +34,7 @@ const { extractBulkCatalogItems } = require("../lib/claude/extractBulkCatalogIte
 const { extractPdfPagesWithImages } = require("../lib/pdfImageExtractor");
 const { uploadDocumentImage } = require("../lib/supabaseStorage");
 const { createDraftProduct, addVariantImage } = require("../lib/shopify");
-const { updateInventoryItemCost } = require("../lib/shopifyInventory");
+const { updateInventoryItemCost, setInitialStockQuantity } = require("../lib/shopifyInventory");
 const { computeCostPrice } = require("../lib/pricingCalculator");
 const { sendBulkImportDigestEmail } = require("../lib/email/sendBulkImportDigestEmail");
 const { sendBulkImportCompletionMessage } = require("../lib/sendBulkImportCompletionMessage");
@@ -119,7 +119,12 @@ async function extractPagesWithUploadedImages(batch) {
       }
       renumberedImages.push({ index: globalIndex, mimeType: img.mimeType, bytes: img.bytes });
     }
-    pagesForExtraction.push({ pageNumber: page.pageNumber, text: page.text, images: renumberedImages });
+    pagesForExtraction.push({
+      pageNumber: page.pageNumber,
+      text: page.text,
+      images: renumberedImages,
+      skippedNonJpeg: page.skippedNonJpeg || 0,
+    });
   }
 
   if (skippedNonJpegImageCount > 0) {
@@ -171,6 +176,7 @@ async function extractPendingBatch() {
         value: v.value,
         sku: v.sku,
         mrp: v.mrp,
+        quantity: v.quantity ?? null,
         documentImageUrl: v.documentImageIndex != null ? globalIndexToUrl.get(v.documentImageIndex) || null : null,
       })),
     }));
@@ -216,15 +222,24 @@ async function extractPendingBatch() {
         // on their own Supplier.brands list; an unidentified brand is
         // treated the same as a disallowed one (never assume it's fine
         // just because we can't tell).
-        const brandAllowed = i.brand && supplierBrands.some((b) => b.toLowerCase() === i.brand.toLowerCase());
-        const rate = brandAllowed ? resolveRate(batch.rateRules, i) : null;
+        //
+        // The document itself doesn't always name a brand per item — a
+        // supplier's own single-brand catalog can just list product names
+        // ("Fineline Polo") with no brand column at all. batch.defaultBrand
+        // is what the supplier told the live agent covers the whole
+        // document in that case (see start_bulk_product_import, backend
+        // repo) — only used when extraction found nothing on the page
+        // itself, never overriding a brand the document actually states.
+        const brand = i.brand || batch.defaultBrand || null;
+        const brandAllowed = brand && supplierBrands.some((b) => b.toLowerCase() === brand.toLowerCase());
+        const rate = brandAllowed ? resolveRate(batch.rateRules, { ...i, brand }) : null;
 
         let status = "PENDING";
         let errorMessage = null;
         if (!brandAllowed) {
           status = "NEEDS_BRAND_REVIEW";
-          errorMessage = i.brand
-            ? `Brand "${i.brand}" is not in this supplier's allowed brands list.`
+          errorMessage = brand
+            ? `Brand "${brand}" is not in this supplier's allowed brands list.`
             : "No brand could be identified for this item.";
         } else if (!rate) {
           status = "NEEDS_RATE";
@@ -235,7 +250,7 @@ async function extractPendingBatch() {
           batchId: batch.id,
           title: i.title,
           sku: i.variants[0].sku || null,
-          brand: i.brand || null,
+          brand,
           category: i.category || null,
           shopifyProductType: i.productType || null,
           mrp: i.variants[0].mrp,
@@ -313,7 +328,7 @@ async function processItem(item, batch) {
     // from crashing if it ever does.
     const variants = Array.isArray(item.variantOptions) && item.variantOptions.length > 0
       ? item.variantOptions
-      : [{ value: null, sku: item.sku, mrp: Number(item.mrp), documentImageUrl: null }];
+      : [{ value: null, sku: item.sku, mrp: Number(item.mrp), quantity: null, documentImageUrl: null }];
 
     // Duplicate-check against the whole catalog, one probe per variant —
     // if ANY variant matches something that already exists, the simplest
@@ -509,7 +524,7 @@ async function processItem(item, batch) {
     // vary price by size), so cost price is computed per variant, not once
     // for the whole product.
     const variantCostResults = await Promise.all(
-      shopifyResult.variantResults.map(async (vr) => {
+      shopifyResult.variantResults.map(async (vr, idx) => {
         const costPrice = computeCostPrice({
           mrp: vr.mrp,
           marginPercent: Number(item.marginPercent),
@@ -522,6 +537,22 @@ async function processItem(item, batch) {
             costResult.error,
           );
         }
+
+        // Only when the document itself stated this variant's stock count
+        // (see extractBulkCatalogItems.js's `quantity` field) — a variant
+        // with none falls through to the existing untracked-stock behavior
+        // exactly as before this feature existed.
+        const quantity = variants[idx]?.quantity;
+        if (quantity != null) {
+          const stockResult = await setInitialStockQuantity(vr.shopifyVariantId, quantity);
+          if (!stockResult.ok) {
+            console.error(
+              `[job] productImportDrain: Shopify stock sync failed for variant ${vr.shopifyVariantId} on ${shopifyResult.shopifyProductId}:`,
+              stockResult.error,
+            );
+          }
+        }
+
         return { shopifyVariantId: vr.shopifyVariantId, mrp: vr.mrp, costPrice };
       }),
     );
