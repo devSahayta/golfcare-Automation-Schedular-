@@ -36,6 +36,10 @@ const {
   registerBroadcastSchedulePollJob,
 } = require("./jobs/broadcastSchedulePoll");
 
+const {
+  registerComputeLtvPercentileJob,
+} = require("./jobs/computeLtvPercentile");
+
 console.log("Golf Care OS scheduler starting...");
 registerAvailabilityDecayJob();
 registerSupplierCheckDispatchJob();
@@ -51,5 +55,6 @@ registerProductImportDrainJob();
 registerCampaignImageCleanupJob();
 registerProductImportImageCleanupJob();
 registerBroadcastSchedulePollJob();
+registerComputeLtvPercentileJob();
 
 console.log("Golf Care OS scheduler: all jobs registered.");
