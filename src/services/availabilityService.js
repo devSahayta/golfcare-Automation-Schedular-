@@ -80,6 +80,25 @@ async function setAvailability({
         select: { status: true },
       });
 
+      // Mirrors golfcare-backend's own copy of this same function (kept
+      // in sync manually, same cross-repo reason as everything else in
+      // this file's header comment) — "aged stock" needs to know how
+      // long THIS run of stock has been sitting confirmed, not how long
+      // ago the row was first created, so Variant.receivedAt only ever
+      // moves on a genuine transition into/out of IN_STOCK (e.g. this
+      // job's own TTL sweep expiring a stale confirmation back to
+      // UNKNOWN), never on a routine re-confirmation that stays
+      // IN_STOCK. quantityOnHand (the overstock signal) is only ever
+      // set by golfcare-backend's check-in portal confirm, which this
+      // service never calls — but still gets force-cleared here too
+      // whenever status leaves IN_STOCK, so a stale count from before
+      // this sweep never outlives the stock status it was tied to.
+      const enteringStock =
+        status === "IN_STOCK" && existing?.status !== "IN_STOCK";
+      const leavingStock =
+        status !== "IN_STOCK" && existing?.status === "IN_STOCK";
+      const quantityOnHandValue = status === "IN_STOCK" ? undefined : null;
+
       const state = await tx.availabilityState.upsert({
         where: { variantId },
         create: {
@@ -92,6 +111,7 @@ async function setAvailability({
           confirmedAt: now,
           expiresAt,
           note,
+          quantityOnHand: quantityOnHandValue,
         },
         update: {
           productId: resolvedProductId,
@@ -102,6 +122,7 @@ async function setAvailability({
           confirmedAt: now,
           expiresAt,
           note,
+          quantityOnHand: quantityOnHandValue,
         },
       });
 
@@ -128,7 +149,22 @@ async function setAvailability({
         },
       });
 
-      return { availabilityState: state, previousStatus: existing?.status ?? null };
+      if (enteringStock) {
+        await tx.variant.update({
+          where: { id: variantId },
+          data: { receivedAt: now },
+        });
+      } else if (leavingStock) {
+        await tx.variant.update({
+          where: { id: variantId },
+          data: { receivedAt: null },
+        });
+      }
+
+      return {
+        availabilityState: state,
+        previousStatus: existing?.status ?? null,
+      };
     },
   );
 

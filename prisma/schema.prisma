@@ -46,7 +46,11 @@ model AvailabilityState {
   confirmedBy     String?
   confirmedAt     DateTime          @db.Timestamptz(6)
   expiresAt       DateTime          @db.Timestamptz(6)
-  note            String?
+   note            String?
+  // Mirrors golfcare-backend's own copy — kept in sync manually, same
+  // cross-repo reason as everything else in this schema. See that
+  // repo's schema.prisma / availabilityService.js for the full comment.
+  quantityOnHand  Int?
   AvailabilityLog AvailabilityLog[]
   Product         Product?          @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   Variant         Variant?          @relation(fields: [variantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
@@ -749,6 +753,8 @@ model Variant {
   SupplierProduct   SupplierProduct[]
   Product           Product            @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
+    // See golfcare-backend's schema.prisma / availabilityService.js — now
+  // actively stamped/cleared there on IN_STOCK transitions.
   receivedAt DateTime? @db.Timestamptz(6)
 Offer      Offer[]
   @@index([productId], map: "idx_variant_product")
