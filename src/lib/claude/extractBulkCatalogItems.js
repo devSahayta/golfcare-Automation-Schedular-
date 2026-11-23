@@ -40,14 +40,34 @@ const SONNET_RATE = { inputPerMtok: 3, outputPerMtok: 15 };
 const USD_TO_INR = 95;
 const SEGMENT_CHARS = 6000; // legacy text-only path only
 const PAGES_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_PAGES_PER_SEGMENT) || 3;
-// Confirmed live against a real 1,352-row supplier sheet that 150 was too
-// high a default: nearly every row-batch overflowed MAX_OUTPUT_TOKENS on
-// its first attempt and needed runRowBatchWithRetry to halve it to 75
-// before succeeding — meaning most batches were paying for 3 Claude calls
-// (1 wasted + 2 real) instead of 1. 75 consistently fit; 60 leaves real
-// margin below that measured ceiling rather than sitting right at the
-// edge of it for a denser sheet.
-const ROWS_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_ROWS_PER_SEGMENT) || 60;
+// Confirmed live, twice, that a fixed ROW COUNT per batch doesn't work: a
+// real 1,352-row supplier sheet mixes simple rows (BagBoy accessories) with
+// very dense ones (Titleist multi-club box sets, long descriptions) —
+// sizing every batch the same regardless of content meant dense sections
+// still overflowed MAX_OUTPUT_TOKENS even after lowering the row count
+// once already, and the worst single retry cascade alone cost ₹246 (over a
+// quarter of that whole run's total spend) from repeatedly re-paying for
+// overlapping content on nested retries. Batches are now sized by actual
+// row TEXT LENGTH instead (same idea as SEGMENT_CHARS below, just applied
+// per-row instead of as one flat string) — a batch of short rows naturally
+// holds more of them, a batch of long/dense rows naturally holds fewer,
+// so output size stays roughly consistent across the whole document
+// regardless of which section it's in.
+const ROW_SEGMENT_CHARS = Number(process.env.PRODUCT_IMPORT_ROW_SEGMENT_CHARS) || 3500;
+// Belt-and-suspenders on top of the character budget — a run of many very
+// short rows (e.g. simple single-line accessories) could still pack an
+// unreasonable PRODUCT COUNT into one call even while staying under the
+// character budget, and more products means more output JSON regardless
+// of how little input text each one took.
+const MAX_ROWS_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_MAX_ROWS_PER_SEGMENT) || 80;
+// Floor for runRowBatchWithRetry's halving — stops recursing once a batch
+// is already this small, accepting a best-effort partial result instead.
+// Without this, a batch that's STILL too dense even after several halvings
+// keeps recursing toward single rows, and every one of those nested calls
+// re-sends the header line + its own rows fresh — confirmed live as the
+// actual mechanism behind the ₹246 single-batch cost above, not just a
+// theoretical risk.
+const MIN_ROWS_PER_RETRY = 5;
 const MAX_OUTPUT_TOKENS = 8192;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -103,9 +123,19 @@ function splitIntoPageBatches(pages) {
 
 function splitIntoRowBatches(rows) {
   const batches = [];
-  for (let i = 0; i < rows.length; i += ROWS_PER_SEGMENT) {
-    batches.push(rows.slice(i, i + ROWS_PER_SEGMENT));
+  let current = [];
+  let currentChars = 0;
+  for (const row of rows) {
+    const rowChars = row.length + 1; // +1 for the newline joining it to the next
+    if (current.length > 0 && (currentChars + rowChars > ROW_SEGMENT_CHARS || current.length >= MAX_ROWS_PER_SEGMENT)) {
+      batches.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(row);
+    currentChars += rowChars;
   }
+  if (current.length > 0) batches.push(current);
   return batches;
 }
 
@@ -280,10 +310,10 @@ async function runPageBatchWithRetry(pageBatch, carryForwardBrand) {
 // buildRowBatchContent's own comment for why).
 async function runRowBatchWithRetry(headerLine, rowBatch) {
   const result = await runSegment(buildRowBatchContent(headerLine, rowBatch));
-  if (!result.truncated || rowBatch.length === 1) {
+  if (!result.truncated || rowBatch.length <= MIN_ROWS_PER_RETRY) {
     if (result.truncated) {
       console.warn(
-        `[extractBulkCatalogItems] a single row alone hit max_tokens — response may be incomplete, using what parsed: "${rowBatch[0]?.slice(0, 120)}"`,
+        `[extractBulkCatalogItems] a ${rowBatch.length}-row batch hit max_tokens at or below the ${MIN_ROWS_PER_RETRY}-row retry floor — response may be incomplete, using what parsed. First row: "${rowBatch[0]?.slice(0, 120)}"`,
       );
     }
     return result;

@@ -793,8 +793,12 @@ async function finalizeBatchIfComplete(batchId) {
 }
 
 async function drainProductImportQueue() {
+  // Only batches still genuinely in flight — confirmed live that staff
+  // marking a batch DONE to halt a runaway import didn't stop drafting,
+  // because this used to pick up ANY PENDING item regardless of its
+  // batch's status. Setting a batch to DONE is now a real stop switch.
   const pending = await prisma.productImportItem.findMany({
-    where: { status: "PENDING" },
+    where: { status: "PENDING", Batch: { status: "PROCESSING" } },
     orderBy: { createdAt: "asc" },
     take: BATCH_SIZE,
   });
