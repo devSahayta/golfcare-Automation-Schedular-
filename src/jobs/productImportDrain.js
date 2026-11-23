@@ -33,6 +33,7 @@ const { researchProductSpecs, researchVariantImage } = require("../lib/claude/re
 const { extractBulkCatalogItems } = require("../lib/claude/extractBulkCatalogItems");
 const { extractPdfPagesWithImages, isPdf } = require("../lib/pdfImageExtractor");
 const { extractXlsxRows, isXlsx } = require("../lib/xlsxRowExtractor");
+const { extractDocxFullText, isDocx } = require("../lib/docxTextExtractor");
 const { uploadDocumentImage } = require("../lib/supabaseStorage");
 const { createDraftProduct, addVariantImage } = require("../lib/shopify");
 const { updateInventoryItemCost, setInitialStockQuantity } = require("../lib/shopifyInventory");
@@ -173,14 +174,21 @@ async function extractPendingBatch() {
         const prepared = await extractPagesWithUploadedImages(batch, sourceBuffer);
         globalIndexToUrl = prepared.globalIndexToUrl;
         rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction });
+      } else if (isDocx(sourceBuffer)) {
+        // Checked before isXlsx — .xlsx/.docx/.pptx all share the same
+        // zip signature, and isDocx's own word/document.xml check is the
+        // specific, unambiguous one; isXlsx only confirms the ABSENCE of
+        // that (plus pptx's own marker), so it must run second.
+        const fullText = await extractDocxFullText(sourceBuffer);
+        rawResult = await extractBulkCatalogItems({ documentText: fullText });
       } else if (isXlsx(sourceBuffer)) {
         const { headerLine, rows } = await extractXlsxRows(sourceBuffer);
         rawResult = await extractBulkCatalogItems({ headerLine, rows });
       } else {
-        // No full-fidelity reader for this format (e.g. a .docx/.pptx
-        // catalog) — fail loudly into the same extractionError path below
-        // rather than silently mis-parsing it as the wrong format.
-        throw new Error("Attachment is not a PDF or spreadsheet this pipeline can read in full.");
+        // No full-fidelity reader for this format (e.g. a .pptx catalog)
+        // — fail loudly into the same extractionError path below rather
+        // than silently mis-parsing it as the wrong format.
+        throw new Error("Attachment is not a PDF, spreadsheet, or Word document this pipeline can read in full.");
       }
     } else {
       rawResult = await extractBulkCatalogItems({ documentText: batch.rawDocumentText || "" });
