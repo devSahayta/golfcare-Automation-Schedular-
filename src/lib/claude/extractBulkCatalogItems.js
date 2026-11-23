@@ -40,12 +40,14 @@ const SONNET_RATE = { inputPerMtok: 3, outputPerMtok: 15 };
 const USD_TO_INR = 95;
 const SEGMENT_CHARS = 6000; // legacy text-only path only
 const PAGES_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_PAGES_PER_SEGMENT) || 3;
-// Tuned so a typical row-batch's worth of distinct products comfortably
-// produces JSON under MAX_OUTPUT_TOKENS — same reasoning PAGES_PER_SEGMENT
-// documents for PDFs, just in "rows" instead of "pages." Confirmed against
-// a real 1,352-row supplier sheet (xlsxRowExtractor.js) that this leaves
-// headroom even on its densest sections.
-const ROWS_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_ROWS_PER_SEGMENT) || 150;
+// Confirmed live against a real 1,352-row supplier sheet that 150 was too
+// high a default: nearly every row-batch overflowed MAX_OUTPUT_TOKENS on
+// its first attempt and needed runRowBatchWithRetry to halve it to 75
+// before succeeding — meaning most batches were paying for 3 Claude calls
+// (1 wasted + 2 real) instead of 1. 75 consistently fit; 60 leaves real
+// margin below that measured ceiling rather than sitting right at the
+// edge of it for a denser sheet.
+const ROWS_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_ROWS_PER_SEGMENT) || 60;
 const MAX_OUTPUT_TOKENS = 8192;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -360,11 +362,33 @@ async function runTextSegmentWithRetry(segmentText) {
  *        or returns URLs, only bytes in and indices out.
  * @param {string} [input.documentText]
  *        Legacy text-only mode, used only when neither `rows` nor `pages` is given.
- * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, productType:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, quantity:number|null, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number}>}
+ * @param {number} [input.startUnitIndex]
+ *        Resume point — skips this many of the source's own units (rows for
+ *        `rows` mode, pages for `pages` mode, text-segments for
+ *        `documentText` mode) before extracting. Confirmed live as a real
+ *        need: a long-running extraction used to hold everything in memory
+ *        until the whole document finished, so a worker restart mid-way
+ *        lost all of it — this (paired with `onUnitComplete`) is what lets
+ *        productImportDrain.js persist as it goes and pick back up from
+ *        where it left off instead of from scratch.
+ * @param {(result: {items: object[], inputTokens: number, outputTokens: number, unitsProcessed: number}) => (void | Promise<void>)} [input.onUnitComplete]
+ *        Called after EACH unit-batch completes, with just that batch's own
+ *        items/usage — lets the caller persist incrementally instead of
+ *        waiting for the whole document. Awaited before moving to the next
+ *        batch, so a failure inside it (e.g. a DB write) aborts extraction
+ *        at exactly that point, same as any other error here — whatever
+ *        already ran the callback successfully stays persisted regardless.
+ * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, productType:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, quantity:number|null, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number, totalUnitCount: number}>}
  */
-async function extractBulkCatalogItems({ headerLine, rows, pages, documentText }) {
-  const rowBatches = Array.isArray(rows) && rows.length > 0 ? splitIntoRowBatches(rows) : null;
-  const segments = !rowBatches && Array.isArray(pages) && pages.length > 0 ? splitIntoPageBatches(pages) : null;
+async function extractBulkCatalogItems({ headerLine, rows, pages, documentText, startUnitIndex = 0, onUnitComplete }) {
+  const allRows = Array.isArray(rows) && rows.length > 0 ? rows : null;
+  const allPages = !allRows && Array.isArray(pages) && pages.length > 0 ? pages : null;
+  const allTextSegments = !allRows && !allPages ? splitIntoCharSegments(documentText || "") : null;
+
+  const totalUnitCount = allRows ? allRows.length : allPages ? allPages.length : allTextSegments.length;
+  const rowBatches = allRows ? splitIntoRowBatches(allRows.slice(startUnitIndex)) : null;
+  const segments = allPages ? splitIntoPageBatches(allPages.slice(startUnitIndex)) : null;
+  const remainingTextSegments = allTextSegments ? allTextSegments.slice(startUnitIndex) : null;
 
   let items = [];
   let inputTokens = 0;
@@ -378,6 +402,12 @@ async function extractBulkCatalogItems({ headerLine, rows, pages, documentText }
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
       segmentCount++;
+      await onUnitComplete?.({
+        items: result.items,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        unitsProcessed: rowBatch.length,
+      });
     }
   } else if (segments) {
     // Each page-batch is its own isolated API call with no memory of any
@@ -398,6 +428,12 @@ async function extractBulkCatalogItems({ headerLine, rows, pages, documentText }
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
       segmentCount++;
+      await onUnitComplete?.({
+        items: result.items,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        unitsProcessed: pageBatch.length,
+      });
       const lastBrand = [...result.items].reverse().find((it) => it.brand)?.brand;
       if (lastBrand) {
         carryForwardBrand = lastBrand;
@@ -416,18 +452,23 @@ async function extractBulkCatalogItems({ headerLine, rows, pages, documentText }
       }
     }
   } else {
-    const textSegments = splitIntoCharSegments(documentText || "");
-    for (const segment of textSegments) {
+    for (const segment of remainingTextSegments) {
       const result = await runTextSegmentWithRetry(segment);
       items = items.concat(result.items);
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
       segmentCount++;
+      await onUnitComplete?.({
+        items: result.items,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        unitsProcessed: 1,
+      });
     }
   }
 
   const usage = { inputTokens, outputTokens };
-  return { items, usage, cost: computeCost(usage), segmentCount };
+  return { items, usage, cost: computeCost(usage), segmentCount, totalUnitCount };
 }
 
-module.exports = { extractBulkCatalogItems };
+module.exports = { extractBulkCatalogItems, computeCost };

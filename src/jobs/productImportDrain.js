@@ -30,7 +30,7 @@ const { setAvailability } = require("../services/availabilityService");
 const { findExistingCatalogMatch, findPendingDraftMatch } = require("../lib/productCatalogMatch");
 const { broadTagFor } = require("../lib/shopifyTaxonomy");
 const { researchProductSpecs, researchVariantImage } = require("../lib/claude/researchProductSpecs");
-const { extractBulkCatalogItems } = require("../lib/claude/extractBulkCatalogItems");
+const { extractBulkCatalogItems, computeCost } = require("../lib/claude/extractBulkCatalogItems");
 const { extractPdfPagesWithImages, isPdf } = require("../lib/pdfImageExtractor");
 const { extractXlsxRows, isXlsx } = require("../lib/xlsxRowExtractor");
 const { extractDocxFullText, isDocx } = require("../lib/docxTextExtractor");
@@ -137,13 +137,159 @@ async function extractPagesWithUploadedImages(batch, pdfBuffer) {
   return { pagesForExtraction, globalIndexToUrl };
 }
 
+// Turns ONE unit-batch's (a row-batch, page-batch, or text-segment) raw
+// extracted items into real ProductImportItem rows and advances the
+// batch's running counters — called incrementally, once per unit-batch, as
+// extractBulkCatalogItems produces them (see its onUnitComplete param),
+// instead of once for the whole document at the very end. This is the
+// actual fix for a worker restart losing everything: confirmed live that a
+// 1,352-row real supplier sheet ran for 10+ minutes making real paid
+// Claude calls with ZERO rows yet written to the DB, because the old code
+// only persisted after extraction of the ENTIRE document finished — a
+// restart at any point before that lost 100% of the cost and progress.
+// Each call here commits durably the moment it returns, regardless of what
+// happens to any later unit.
+//
+// Each extracted entry is one PRODUCT (possibly several real variants —
+// see extractBulkCatalogItems.js), stored as one ProductImportItem row
+// with the full variant list in variantOptions, not one row per SKU.
+// Top-level sku/mrp mirror the first variant for simple display. Each
+// item's margin/GST are resolved against the batch's rateRules here, once
+// — nothing downstream (processItem, etc.) needs to know rates ever varied
+// by brand/category, it just reads the already-resolved value off the row.
+async function persistExtractedUnit(batch, rawItems, globalIndexToUrl, { inputTokens, outputTokens, unitsProcessed, totalItemsSoFar }) {
+  // Resolve each variant's documentImageIndex (meaningless outside this
+  // function — a global index into globalIndexToUrl, nothing else knows
+  // what to do with it) into a real documentImageUrl, or null when there
+  // wasn't a confident match (text-only paths: always null here, same as
+  // every variant always has been until this feature existed).
+  const items = rawItems.map((it) => ({
+    ...it,
+    variants: it.variants.map((v) => ({
+      value: v.value,
+      sku: v.sku,
+      mrp: v.mrp,
+      quantity: v.quantity ?? null,
+      documentImageUrl: v.documentImageIndex != null ? globalIndexToUrl.get(v.documentImageIndex) || null : null,
+    })),
+  }));
+
+  if (batch.conversationId) {
+    try {
+      const cost = computeCost({ inputTokens, outputTokens });
+      await prisma.agentUsage.create({
+        data: {
+          conversationId: batch.conversationId,
+          productImportBatchId: batch.id,
+          agentName: "SUPPLIER_BULK_IMPORT",
+          model: "claude-sonnet-4-6",
+          inputTokens,
+          outputTokens,
+          costUsd: cost.usd,
+          costInr: cost.inr,
+          toolCallCount: 1,
+          outcome: items.length > 0 ? "extracted" : "no_items_found",
+        },
+      });
+    } catch (err) {
+      console.error(`[job] productImportDrain: AgentUsage log failed for batch ${batch.id} extraction:`, err.message);
+    }
+  }
+
+  const supplierBrands = batch.Supplier?.brands || [];
+  // MAX_ITEMS_PER_BATCH is a running budget across every incremental call
+  // for this batch, not a per-call limit — same overall cap as before,
+  // just enforced cumulatively instead of in one slice at the end.
+  const remainingBudget = Math.max(0, MAX_ITEMS_PER_BATCH - totalItemsSoFar);
+  const cleanItems = items
+    .filter((i) => Array.isArray(i.variants) && i.variants.length > 0)
+    .slice(0, remainingBudget)
+    .map((i) => {
+      // Brand authorization takes priority over rate-resolution — no point
+      // resolving a margin/GST rate for an item that's going to be held
+      // back regardless. A supplier should only ever draft brands on their
+      // own Supplier.brands list; an unidentified brand is treated the
+      // same as a disallowed one (never assume it's fine just because we
+      // can't tell).
+      //
+      // The document itself doesn't always name a brand per item — a
+      // supplier's own single-brand catalog can just list product names
+      // ("Fineline Polo") with no brand column at all. batch.defaultBrand
+      // is what the supplier told the live agent covers the whole document
+      // in that case (see start_bulk_product_import, backend repo) — only
+      // used when extraction found nothing on the page itself, never
+      // overriding a brand the document actually states.
+      const brand = i.brand || batch.defaultBrand || null;
+      const brandAllowed = brand && supplierBrands.some((b) => b.toLowerCase() === brand.toLowerCase());
+      const rate = brandAllowed ? resolveRate(batch.rateRules, { ...i, brand }) : null;
+
+      let status = "PENDING";
+      let errorMessage = null;
+      if (!brandAllowed) {
+        status = "NEEDS_BRAND_REVIEW";
+        errorMessage = brand
+          ? `Brand "${brand}" is not in this supplier's allowed brands list.`
+          : "No brand could be identified for this item.";
+      } else if (!rate) {
+        status = "NEEDS_RATE";
+        errorMessage = "No margin/GST rate rule matched this item's brand/category.";
+      }
+
+      return {
+        batchId: batch.id,
+        title: i.title,
+        sku: i.variants[0].sku || null,
+        brand,
+        category: i.category || null,
+        shopifyProductType: i.productType || null,
+        mrp: i.variants[0].mrp,
+        marginPercent: rate?.marginPercent ?? null,
+        gstPercent: rate?.gstPercent ?? null,
+        variantOptionName: i.variantOptionName || null,
+        variantOptions: i.variants,
+        status,
+        errorMessage,
+        // NEEDS_RATE/NEEDS_BRAND_REVIEW items are already "done" from the
+        // drain loop's perspective (it only ever queries PENDING) —
+        // processedAt now marks that explicitly rather than leaving it
+        // looking stuck.
+        processedAt: status === "PENDING" ? null : new Date(),
+      };
+    });
+
+  if (cleanItems.length > 0) {
+    await prisma.productImportItem.createMany({ data: cleanItems });
+  }
+
+  const needsRateCount = cleanItems.filter((i) => i.status === "NEEDS_RATE").length;
+  const needsBrandReviewCount = cleanItems.filter((i) => i.status === "NEEDS_BRAND_REVIEW").length;
+  await prisma.productImportBatch.update({
+    where: { id: batch.id },
+    data: {
+      totalItems: { increment: cleanItems.length },
+      processedItems: { increment: needsRateCount + needsBrandReviewCount },
+      needsRateCount: { increment: needsRateCount },
+      needsBrandReviewCount: { increment: needsBrandReviewCount },
+      extractedUnitCount: { increment: unitsProcessed },
+    },
+  });
+
+  return cleanItems.length;
+}
+
 // Parses one PENDING_EXTRACTION batch's raw document text (and, when
 // sourceMediaUrl is set, its real embedded product photos) into real
 // ProductImportItem rows, then flips it to PROCESSING so the normal
-// draining loop below picks it up exactly like any other batch. One
-// batch per tick — a genuinely huge document's extraction (several
-// Claude calls, see extractBulkCatalogItems.js) can take a while, and
-// there's no reason to block that tick on more than one.
+// draining loop below picks it up exactly like any other batch. One batch
+// per tick — a genuinely huge document's extraction (several Claude calls,
+// see extractBulkCatalogItems.js) can take a while, and there's no reason
+// to block that tick on more than one.
+//
+// Resumable: batch.extractedUnitCount records how far a PRIOR attempt at
+// this same batch already got (persistExtractedUnit advances it as each
+// unit-batch completes), so re-picking up a batch that was interrupted
+// mid-document (worker restart/deploy/crash) continues from there instead
+// of re-extracting (and re-paying for) rows/pages already done.
 async function extractPendingBatch() {
   const batch = await prisma.productImportBatch.findFirst({
     where: { status: "PENDING_EXTRACTION" },
@@ -152,9 +298,21 @@ async function extractPendingBatch() {
   });
   if (!batch) return null;
 
+  let totalItemsSoFar = batch.totalItems;
+  let globalIndexToUrl = new Map();
+  const startUnitIndex = batch.extractedUnitCount;
+
+  const onUnitComplete = async ({ items: rawItems, inputTokens, outputTokens, unitsProcessed }) => {
+    totalItemsSoFar += await persistExtractedUnit(batch, rawItems, globalIndexToUrl, {
+      inputTokens,
+      outputTokens,
+      unitsProcessed,
+      totalItemsSoFar,
+    });
+  };
+
   try {
     let rawResult;
-    let globalIndexToUrl = new Map();
 
     // No sourceMediaUrl means this batch predates the feature — falls back
     // to the original text-only path untouched, not a backfill target.
@@ -173,17 +331,17 @@ async function extractPendingBatch() {
       if (isPdf(sourceBuffer)) {
         const prepared = await extractPagesWithUploadedImages(batch, sourceBuffer);
         globalIndexToUrl = prepared.globalIndexToUrl;
-        rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction });
+        rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction, startUnitIndex, onUnitComplete });
       } else if (isDocx(sourceBuffer)) {
         // Checked before isXlsx — .xlsx/.docx/.pptx all share the same
         // zip signature, and isDocx's own word/document.xml check is the
         // specific, unambiguous one; isXlsx only confirms the ABSENCE of
         // that (plus pptx's own marker), so it must run second.
         const fullText = await extractDocxFullText(sourceBuffer);
-        rawResult = await extractBulkCatalogItems({ documentText: fullText });
+        rawResult = await extractBulkCatalogItems({ documentText: fullText, startUnitIndex, onUnitComplete });
       } else if (isXlsx(sourceBuffer)) {
         const { headerLine, rows } = await extractXlsxRows(sourceBuffer);
-        rawResult = await extractBulkCatalogItems({ headerLine, rows });
+        rawResult = await extractBulkCatalogItems({ headerLine, rows, startUnitIndex, onUnitComplete });
       } else {
         // No full-fidelity reader for this format (e.g. a .pptx catalog)
         // — fail loudly into the same extractionError path below rather
@@ -191,113 +349,25 @@ async function extractPendingBatch() {
         throw new Error("Attachment is not a PDF, spreadsheet, or Word document this pipeline can read in full.");
       }
     } else {
-      rawResult = await extractBulkCatalogItems({ documentText: batch.rawDocumentText || "" });
+      rawResult = await extractBulkCatalogItems({ documentText: batch.rawDocumentText || "", startUnitIndex, onUnitComplete });
     }
 
-    // Resolve each variant's documentImageIndex (meaningless outside this
-    // function — a global index into globalIndexToUrl, nothing else knows
-    // what to do with it) into a real documentImageUrl, or null when there
-    // wasn't a confident match (legacy text-only path: always null here,
-    // same as every variant always has been until this feature existed).
-    const items = rawResult.items.map((it) => ({
-      ...it,
-      variants: it.variants.map((v) => ({
-        value: v.value,
-        sku: v.sku,
-        mrp: v.mrp,
-        quantity: v.quantity ?? null,
-        documentImageUrl: v.documentImageIndex != null ? globalIndexToUrl.get(v.documentImageIndex) || null : null,
-      })),
-    }));
-    const { usage, cost, segmentCount } = rawResult;
+    // Every remaining unit has now been extracted AND persisted
+    // (incrementally, via onUnitComplete above) — extractedUnitCount
+    // already reflects this through persistExtractedUnit's own increments,
+    // but set it explicitly to the real total here too, defensively: a run
+    // that started already fully caught up (a stale PENDING_EXTRACTION
+    // batch re-picked up after a prior attempt already finished reading
+    // the source) processes zero new units, so onUnitComplete never fires
+    // to bump it.
+    await prisma.productImportBatch.update({
+      where: { id: batch.id },
+      data: { extractedUnitCount: rawResult.totalUnitCount },
+    });
 
-    if (batch.conversationId) {
-      try {
-        await prisma.agentUsage.create({
-          data: {
-            conversationId: batch.conversationId,
-            productImportBatchId: batch.id,
-            agentName: "SUPPLIER_BULK_IMPORT",
-            model: "claude-sonnet-4-6",
-            inputTokens: usage.inputTokens,
-            outputTokens: usage.outputTokens,
-            costUsd: cost.usd,
-            costInr: cost.inr,
-            toolCallCount: segmentCount,
-            outcome: items.length > 0 ? "extracted" : "no_items_found",
-          },
-        });
-      } catch (err) {
-        console.error(`[job] productImportDrain: AgentUsage log failed for batch ${batch.id} extraction:`, err.message);
-      }
-    }
+    const freshBatch = await prisma.productImportBatch.findUnique({ where: { id: batch.id } });
 
-    // Each extracted entry is one PRODUCT (possibly several real variants —
-    // see extractBulkCatalogItems.js) — stored as one ProductImportItem row
-    // with the full variant list in variantOptions, not one row per SKU.
-    // Top-level sku/mrp mirror the first variant for simple display. Each
-    // item's margin/GST are resolved against the batch's rateRules here,
-    // once — nothing downstream (processItem, etc.) needs to know rates
-    // ever varied by brand/category, it just reads the already-resolved
-    // value off the row.
-    const supplierBrands = batch.Supplier?.brands || [];
-    const cleanItems = items
-      .filter((i) => Array.isArray(i.variants) && i.variants.length > 0)
-      .slice(0, MAX_ITEMS_PER_BATCH)
-      .map((i) => {
-        // Brand authorization takes priority over rate-resolution — no
-        // point resolving a margin/GST rate for an item that's going to be
-        // held back regardless. A supplier should only ever draft brands
-        // on their own Supplier.brands list; an unidentified brand is
-        // treated the same as a disallowed one (never assume it's fine
-        // just because we can't tell).
-        //
-        // The document itself doesn't always name a brand per item — a
-        // supplier's own single-brand catalog can just list product names
-        // ("Fineline Polo") with no brand column at all. batch.defaultBrand
-        // is what the supplier told the live agent covers the whole
-        // document in that case (see start_bulk_product_import, backend
-        // repo) — only used when extraction found nothing on the page
-        // itself, never overriding a brand the document actually states.
-        const brand = i.brand || batch.defaultBrand || null;
-        const brandAllowed = brand && supplierBrands.some((b) => b.toLowerCase() === brand.toLowerCase());
-        const rate = brandAllowed ? resolveRate(batch.rateRules, { ...i, brand }) : null;
-
-        let status = "PENDING";
-        let errorMessage = null;
-        if (!brandAllowed) {
-          status = "NEEDS_BRAND_REVIEW";
-          errorMessage = brand
-            ? `Brand "${brand}" is not in this supplier's allowed brands list.`
-            : "No brand could be identified for this item.";
-        } else if (!rate) {
-          status = "NEEDS_RATE";
-          errorMessage = "No margin/GST rate rule matched this item's brand/category.";
-        }
-
-        return {
-          batchId: batch.id,
-          title: i.title,
-          sku: i.variants[0].sku || null,
-          brand,
-          category: i.category || null,
-          shopifyProductType: i.productType || null,
-          mrp: i.variants[0].mrp,
-          marginPercent: rate?.marginPercent ?? null,
-          gstPercent: rate?.gstPercent ?? null,
-          variantOptionName: i.variantOptionName || null,
-          variantOptions: i.variants,
-          status,
-          errorMessage,
-          // NEEDS_RATE/NEEDS_BRAND_REVIEW items are already "done" from the
-          // drain loop's perspective (it only ever queries PENDING) —
-          // processedAt now marks that explicitly rather than leaving it
-          // looking stuck.
-          processedAt: status === "PENDING" ? null : new Date(),
-        };
-      });
-
-    if (cleanItems.length === 0) {
+    if (freshBatch.totalItems === 0) {
       await prisma.productImportBatch.update({
         where: { id: batch.id },
         data: { status: "DONE", completedAt: new Date(), extractionError: "No priced product rows found in document." },
@@ -305,27 +375,21 @@ async function extractPendingBatch() {
       return { batchId: batch.id, extracted: 0 };
     }
 
-    const needsRateCount = cleanItems.filter((i) => i.status === "NEEDS_RATE").length;
-    const needsBrandReviewCount = cleanItems.filter((i) => i.status === "NEEDS_BRAND_REVIEW").length;
-    await prisma.productImportItem.createMany({ data: cleanItems });
     await prisma.productImportBatch.update({
       where: { id: batch.id },
-      data: {
-        totalItems: cleanItems.length,
-        processedItems: needsRateCount + needsBrandReviewCount,
-        needsRateCount,
-        needsBrandReviewCount,
-        status: "PROCESSING",
-      },
+      data: { status: "PROCESSING" },
     });
     // No-ops unless EVERY item came back NEEDS_RATE/NEEDS_BRAND_REVIEW
     // (nothing PENDING for the normal drain loop to ever reach this batch
-    // through) — see
-    // finalizeBatchIfComplete's own comment.
+    // through) — see finalizeBatchIfComplete's own comment.
     await finalizeBatchIfComplete(batch.id);
-    return { batchId: batch.id, extracted: cleanItems.length, needsRate: needsRateCount };
+    return { batchId: batch.id, extracted: freshBatch.totalItems, needsRate: freshBatch.needsRateCount };
   } catch (err) {
     console.error(`[job] productImportDrain: extraction failed for batch ${batch.id}:`, err.message);
+    // Whatever units completed before this error already persisted via
+    // onUnitComplete — extractionError is just a breadcrumb, not a signal
+    // that nothing happened. The batch stays PENDING_EXTRACTION, so the
+    // next tick resumes from batch.extractedUnitCount, not from scratch.
     await prisma.productImportBatch.update({
       where: { id: batch.id },
       data: { extractionError: String(err.message).slice(0, 500) },

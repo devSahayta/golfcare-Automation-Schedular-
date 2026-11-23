@@ -636,6 +636,17 @@ model ProductImportBatch {
   // See ImportItemStatus.NEEDS_BRAND_REVIEW.
   needsBrandReviewCount Int         @default(0)
   status          ImportBatchStatus @default(PENDING_EXTRACTION)
+  // How many of the source document's own units (rows for an xlsx, pages
+  // for a PDF, text-segments for a docx/legacy document) have already been
+  // extracted AND persisted as real ProductImportItem rows. Confirmed live
+  // as a genuine gap this fixes: extraction used to accumulate everything
+  // in memory for the WHOLE document and only write to the DB once it
+  // fully finished — a worker restart/deploy/crash at any point mid-run
+  // lost 100% of the Claude spend and progress up to that moment. Now each
+  // unit-batch's items are written as it completes and this count advances
+  // with it, so extractPendingBatch (productImportDrain.js, this repo) can
+  // resume from here instead of from scratch.
+  extractedUnitCount Int            @default(0)
   rawDocumentText String?
   // The original WhatsApp attachment's own Message.mediaUrl, captured at
   // batch-creation time (backend's start_bulk_product_import). Lets this
