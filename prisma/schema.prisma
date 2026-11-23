@@ -46,7 +46,11 @@ model AvailabilityState {
   confirmedBy     String?
   confirmedAt     DateTime          @db.Timestamptz(6)
   expiresAt       DateTime          @db.Timestamptz(6)
-  note            String?
+   note            String?
+  // Mirrors golfcare-backend's own copy — kept in sync manually, same
+  // cross-repo reason as everything else in this schema. See that
+  // repo's schema.prisma / availabilityService.js for the full comment.
+  quantityOnHand  Int?
   AvailabilityLog AvailabilityLog[]
   Product         Product?          @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   Variant         Variant?          @relation(fields: [variantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
@@ -109,6 +113,7 @@ model Conversation {
     AgentUsage         AgentUsage[]
   totalCostUsd       Float        @default(0)
   totalCostInr       Float        @default(0)
+  Offer Offer[]
 
   @@index([customerId], map: "idx_conversation_customer")
   @@index([waPhone], map: "idx_conversation_wa_phone")
@@ -185,6 +190,8 @@ model Customer {
   Order                 Order[]
   consentVersion        String?
   BroadcastRecipient BroadcastRecipient[] 
+  ltvPercentile Int?
+Offer         Offer[]
 
   @@index([waPhone], map: "idx_customer_wa_phone")
 }
@@ -423,6 +430,12 @@ model Product {
   AvailabilityState AvailabilityState[]
   SupplierProduct   SupplierProduct[]
   Variant           Variant[]
+  modelYear          Int?
+supersededById     String?
+isSeasonal         Boolean    @default(false)
+pricingLocked      Boolean    @default(false)
+SupersededBy       Product?   @relation("ProductSupersession", fields: [supersededById], references: [id], onDelete: SetNull, onUpdate: NoAction)
+SupersededProducts Product[]  @relation("ProductSupersession")
 
   @@index([embedding], map: "idx_product_embedding")
   @@index([shopifyProductId], map: "idx_product_shopify_id")
@@ -530,6 +543,48 @@ model Supplier {
   SupplierCheck    SupplierCheck[]
   SupplierProduct  SupplierProduct[]
   ProductImportBatch ProductImportBatch[]
+}
+
+model PricingConfig {
+  key       String   @id
+  value     Json
+  updatedBy String
+  updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+}
+
+model DiscountCampaign {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name      String
+  scope     Json
+  percent   Decimal  @db.Decimal
+  startsAt  DateTime @db.Timestamptz(6)
+  endsAt    DateTime @db.Timestamptz(6)
+  createdBy String
+  isActive  Boolean  @default(true)
+}
+
+model Offer {
+  id             String       @id @default(dbgenerated("(gen_random_uuid())::text"))
+  conversationId String
+  customerId     String
+  variantId      String
+  listPrice      Decimal      @db.Decimal
+  offeredPrice   Decimal      @db.Decimal
+  step           Int
+  leversApplied  Json
+  floorAtOffer   Decimal      @db.Decimal
+  status         String
+  expiresAt      DateTime     @db.Timestamptz(6)
+  approvedBy     String?
+  discountCode   String?
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+  Conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Variant        Variant      @relation(fields: [variantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([customerId, variantId, status], map: "idx_offer_customer_variant_status")
+  @@index([expiresAt], map: "idx_offer_expires_at")
+  @@index([conversationId], map: "idx_offer_conversation")
 }
 
 enum ImportBatchStatus {
@@ -698,6 +753,10 @@ model Variant {
   SupplierProduct   SupplierProduct[]
   Product           Product            @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
+    // See golfcare-backend's schema.prisma / availabilityService.js — now
+  // actively stamped/cleared there on IN_STOCK transitions.
+  receivedAt DateTime? @db.Timestamptz(6)
+Offer      Offer[]
   @@index([productId], map: "idx_variant_product")
 }
 
