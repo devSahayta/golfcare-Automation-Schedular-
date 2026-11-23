@@ -156,4 +156,12 @@ async function extractPdfPagesWithImages(pdfBuffer) {
   return { pages, skippedNonJpegImageCount };
 }
 
-module.exports = { extractPdfPagesWithImages };
+// Used by productImportDrain.js's format-aware dispatch (see
+// xlsxRowExtractor.js's isXlsx for the spreadsheet counterpart) to decide
+// which extraction path a sourceMediaUrl attachment needs, after
+// downloading it exactly once.
+function isPdf(buffer) {
+  return buffer.length >= 4 && buffer.subarray(0, 4).toString("latin1") === "%PDF";
+}
+
+module.exports = { extractPdfPagesWithImages, isPdf };

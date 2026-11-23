@@ -31,7 +31,8 @@ const { findExistingCatalogMatch, findPendingDraftMatch } = require("../lib/prod
 const { broadTagFor } = require("../lib/shopifyTaxonomy");
 const { researchProductSpecs, researchVariantImage } = require("../lib/claude/researchProductSpecs");
 const { extractBulkCatalogItems } = require("../lib/claude/extractBulkCatalogItems");
-const { extractPdfPagesWithImages } = require("../lib/pdfImageExtractor");
+const { extractPdfPagesWithImages, isPdf } = require("../lib/pdfImageExtractor");
+const { extractXlsxRows, isXlsx } = require("../lib/xlsxRowExtractor");
 const { uploadDocumentImage } = require("../lib/supabaseStorage");
 const { createDraftProduct, addVariantImage } = require("../lib/shopify");
 const { updateInventoryItemCost, setInitialStockQuantity } = require("../lib/shopifyInventory");
@@ -86,20 +87,19 @@ function resolveRate(rateRules, item) {
   return best ? { marginPercent: best.marginPercent, gstPercent: best.gstPercent } : null;
 }
 
-// Re-fetches the original PDF (sourceMediaUrl, set at batch-creation time
-// by backend's start_bulk_product_import) and pulls its embedded product
-// photos + per-page text (pdfImageExtractor.js), uploading each DISTINCT
-// image exactly once (by content hash — a repeated logo/banner across many
-// pages shouldn't become many uploads) to Supabase Storage. Images are
-// renumbered with a GLOBALLY unique index across the whole document before
-// being handed to extractBulkCatalogItems — a per-page-local index (0, 1,
-// 2...) would collide across pages once several pages' images land in the
-// same Claude call (page-batched, see PAGES_PER_SEGMENT), so there'd be no
-// way to tell "page 1's image 0" from "page 4's image 0" apart when
-// resolving documentImageIndex back to a real URL afterward.
-async function extractPagesWithUploadedImages(batch) {
-  const pdfRes = await axios.get(batch.sourceMediaUrl, { responseType: "arraybuffer" });
-  const pdfBuffer = Buffer.from(pdfRes.data);
+// Pulls the original PDF's embedded product photos + per-page text
+// (pdfImageExtractor.js) out of its already-downloaded bytes (see
+// extractPendingBatch, which downloads sourceMediaUrl once and sniffs its
+// format before calling this), uploading each DISTINCT image exactly once
+// (by content hash — a repeated logo/banner across many pages shouldn't
+// become many uploads) to Supabase Storage. Images are renumbered with a
+// GLOBALLY unique index across the whole document before being handed to
+// extractBulkCatalogItems — a per-page-local index (0, 1, 2...) would
+// collide across pages once several pages' images land in the same Claude
+// call (page-batched, see PAGES_PER_SEGMENT), so there'd be no way to tell
+// "page 1's image 0" from "page 4's image 0" apart when resolving
+// documentImageIndex back to a real URL afterward.
+async function extractPagesWithUploadedImages(batch, pdfBuffer) {
   const { pages, skippedNonJpegImageCount } = await extractPdfPagesWithImages(pdfBuffer);
 
   const hashToGlobalIndex = new Map();
@@ -158,9 +158,30 @@ async function extractPendingBatch() {
     // No sourceMediaUrl means this batch predates the feature — falls back
     // to the original text-only path untouched, not a backfill target.
     if (batch.sourceMediaUrl) {
-      const prepared = await extractPagesWithUploadedImages(batch);
-      globalIndexToUrl = prepared.globalIndexToUrl;
-      rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction });
+      // Downloaded once, then sniffed by its own magic bytes — not by
+      // filename/extension (start_bulk_product_import never stores one) —
+      // so the right full-fidelity extraction path is used regardless of
+      // attachment type. Re-reading the RAW file here (not
+      // batch.rawDocumentText) is the whole point for both formats: that
+      // field was already truncated to env.documentExtractMaxChars at
+      // message-ingestion time (backend's documentExtractor.js), which a
+      // real catalog of any size blows past.
+      const sourceRes = await axios.get(batch.sourceMediaUrl, { responseType: "arraybuffer" });
+      const sourceBuffer = Buffer.from(sourceRes.data);
+
+      if (isPdf(sourceBuffer)) {
+        const prepared = await extractPagesWithUploadedImages(batch, sourceBuffer);
+        globalIndexToUrl = prepared.globalIndexToUrl;
+        rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction });
+      } else if (isXlsx(sourceBuffer)) {
+        const { headerLine, rows } = await extractXlsxRows(sourceBuffer);
+        rawResult = await extractBulkCatalogItems({ headerLine, rows });
+      } else {
+        // No full-fidelity reader for this format (e.g. a .docx/.pptx
+        // catalog) — fail loudly into the same extractionError path below
+        // rather than silently mis-parsing it as the wrong format.
+        throw new Error("Attachment is not a PDF or spreadsheet this pipeline can read in full.");
+      }
     } else {
       rawResult = await extractBulkCatalogItems({ documentText: batch.rawDocumentText || "" });
     }

@@ -40,13 +40,19 @@ const SONNET_RATE = { inputPerMtok: 3, outputPerMtok: 15 };
 const USD_TO_INR = 95;
 const SEGMENT_CHARS = 6000; // legacy text-only path only
 const PAGES_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_PAGES_PER_SEGMENT) || 3;
+// Tuned so a typical row-batch's worth of distinct products comfortably
+// produces JSON under MAX_OUTPUT_TOKENS — same reasoning PAGES_PER_SEGMENT
+// documents for PDFs, just in "rows" instead of "pages." Confirmed against
+// a real 1,352-row supplier sheet (xlsxRowExtractor.js) that this leaves
+// headroom even on its densest sections.
+const ROWS_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_ROWS_PER_SEGMENT) || 150;
 const MAX_OUTPUT_TOKENS = 8192;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const PRODUCT_TYPE_VOCABULARY = VOCABULARY.map(([type]) => type).join(", ");
 
-const SYSTEM_PROMPT = `You are extracting a structured product list from a raw, messy price-catalog document (text extracted from a PDF — spacing and line breaks may be imperfect). Some of what you're shown also includes the document's own real product photos, each clearly labeled with the page and an image index it belongs to (e.g. "[Page 3, Image 0]") — use those when deciding each variant's documentImageIndex.
+const SYSTEM_PROMPT = `You are extracting a structured product list from a raw price-catalog document — either messy text extracted from a PDF (spacing and line breaks may be imperfect), or rows from a supplier's own spreadsheet (pipe-separated cell values, one row per line). Some of what you're shown also includes the document's own real product photos, each clearly labeled with the page and an image index it belongs to (e.g. "[Page 3, Image 0]") — use those when deciding each variant's documentImageIndex.
 
 Respond with ONLY a JSON array, no other text, no markdown code fences:
 [{"title": "...", "brand": "..." or null, "category": "..." or null, "productType": "..." or null, "variantOptionName": "Color" or "Size" or null, "variants": [{"value": "..." or null, "sku": "..." or null, "mrp": 1234, "quantity": 10 or null, "documentImageIndex": 0 or null}]}, ...]
@@ -65,6 +71,7 @@ Rules:
 - mrp: the number only, no currency symbols or commas. If a price looks obviously corrupted (e.g. "8GG0" where digits got OCR'd into letters), never guess the real number — instead drop that one variant (or the whole product if it's the only variant) rather than inventing a figure.
 - brand: the manufacturer/brand name, if identifiable from context (a section header naming the brand applies to the rows under it — including a brand shown only as a logo/wordmark image, with no brand text on the page at all, if you can read it in the image). You may also be given a "Carried-forward brand" note — the last brand established by an earlier page's own header/logo elsewhere in this same document, since a long brand section commonly doesn't repeat its name on every single page. Use it for rows on a page that shows no brand, header, or logo of its own. The moment a page in front of you shows a different or new brand's own header/logo/text, that overrides the carried-forward note — never let it override what's actually on the page.
 - Never include the same variant twice.
+- If you're shown a spreadsheet header line (the first line, naming each pipe-separated column), use it to know what each column actually means instead of guessing from position alone. A cell combining a code and a name in one value, e.g. "BB912730 (BB MOBILE DEVICE HOLDER)", splits into that variant's own sku ("BB912730") and the product's title ("BB MOBILE DEVICE HOLDER") — the parenthesized part is the human-readable name, the leading code is the sku, never keep them smashed together in title.
 
 If the text segment has no genuine priced product rows at all (e.g. it's pure section-header/thank-you boilerplate), respond with an empty array: []`;
 
@@ -90,6 +97,27 @@ function splitIntoPageBatches(pages) {
     batches.push(pages.slice(i, i + PAGES_PER_SEGMENT));
   }
   return batches;
+}
+
+function splitIntoRowBatches(rows) {
+  const batches = [];
+  for (let i = 0; i < rows.length; i += ROWS_PER_SEGMENT) {
+    batches.push(rows.slice(i, i + ROWS_PER_SEGMENT));
+  }
+  return batches;
+}
+
+// Unlike buildPageBatchContent, there's no carry-forward-brand note and no
+// image blocks — a spreadsheet row states its own brand inline (confirmed
+// against a real supplier sheet: every single row has its own BRAND cell,
+// no section-divider-only brand signal the way a PDF's pages can have), so
+// none of that machinery applies here. The header line is repeated into
+// EVERY batch (not just the first, the way it'd naturally land if this
+// sheet were just character-split) so every call knows what each column
+// means.
+function buildRowBatchContent(headerLine, rowBatch) {
+  const lines = headerLine ? [headerLine, ...rowBatch] : rowBatch;
+  return [{ type: "text", text: lines.join("\n") }];
 }
 
 // Builds one page-batch's message content: alternating text/image blocks,
@@ -245,26 +273,113 @@ async function runPageBatchWithRetry(pageBatch, carryForwardBrand) {
   return { items, inputTokens, outputTokens, truncated: false };
 }
 
+// Same truncation-halving shape as runPageBatchWithRetry, for a row-batch
+// instead of a page-batch — no carry-forward-brand to thread through (see
+// buildRowBatchContent's own comment for why).
+async function runRowBatchWithRetry(headerLine, rowBatch) {
+  const result = await runSegment(buildRowBatchContent(headerLine, rowBatch));
+  if (!result.truncated || rowBatch.length === 1) {
+    if (result.truncated) {
+      console.warn(
+        `[extractBulkCatalogItems] a single row alone hit max_tokens — response may be incomplete, using what parsed: "${rowBatch[0]?.slice(0, 120)}"`,
+      );
+    }
+    return result;
+  }
+
+  const mid = Math.ceil(rowBatch.length / 2);
+  const halves = [rowBatch.slice(0, mid), rowBatch.slice(mid)];
+  console.warn(
+    `[extractBulkCatalogItems] row-batch of ${rowBatch.length} hit max_tokens — retrying as ${halves.map((h) => h.length).join(" + ")} rows`,
+  );
+
+  let items = [];
+  let inputTokens = result.inputTokens;
+  let outputTokens = result.outputTokens;
+  for (const half of halves) {
+    const sub = await runRowBatchWithRetry(headerLine, half);
+    items = items.concat(sub.items);
+    inputTokens += sub.inputTokens;
+    outputTokens += sub.outputTokens;
+  }
+  return { items, inputTokens, outputTokens, truncated: false };
+}
+
+// Same truncation-halving safety net applied to the legacy plain-text
+// segment path (documentText mode) — previously called runSegment()
+// directly with no retry at all, a real pre-existing gap: a dense enough
+// character-bounded segment can truncate exactly like a dense page-batch
+// or row-batch already could, and would silently drop whatever was in it.
+// Halves by splitting the segment's text at a newline near its midpoint
+// (falls back to a hard character split if the segment has no newline
+// near the middle — same fallback splitIntoCharSegments itself already
+// uses).
+async function runTextSegmentWithRetry(segmentText) {
+  const result = await runSegment(segmentText);
+  if (!result.truncated || segmentText.length < 200) {
+    if (result.truncated) {
+      console.warn(
+        `[extractBulkCatalogItems] a short text segment alone hit max_tokens — response may be incomplete, using what parsed`,
+      );
+    }
+    return result;
+  }
+
+  const mid = Math.floor(segmentText.length / 2);
+  let cut = segmentText.lastIndexOf("\n", mid);
+  if (cut <= 0) cut = mid;
+  const halves = [segmentText.slice(0, cut), segmentText.slice(cut)];
+  console.warn(
+    `[extractBulkCatalogItems] text segment (${segmentText.length} chars) hit max_tokens — retrying as ${halves.map((h) => h.length).join(" + ")} chars`,
+  );
+
+  let items = [];
+  let inputTokens = result.inputTokens;
+  let outputTokens = result.outputTokens;
+  for (const half of halves) {
+    const sub = await runTextSegmentWithRetry(half);
+    items = items.concat(sub.items);
+    inputTokens += sub.inputTokens;
+    outputTokens += sub.outputTokens;
+  }
+  return { items, inputTokens, outputTokens, truncated: false };
+}
+
 /**
  * @param {object} input
+ * @param {string} [input.headerLine]
+ * @param {string[]} [input.rows]
+ *        Row-aware mode (xlsxRowExtractor.js) — a supplier spreadsheet's
+ *        full, untruncated data rows, batched ROWS_PER_SEGMENT at a time
+ *        with headerLine repeated into every batch. Checked first; when
+ *        `rows` is a non-empty array, `pages`/`documentText` are ignored.
  * @param {{pageNumber:number, text:string, images:{index:number, mimeType?:string, bytes:Buffer}[], skippedNonJpeg?:number}[]} [input.pages]
  *        Page-aware mode — each returned variant's documentImageIndex refers
  *        to a page-local image index the CALLER must resolve back to a real
  *        URL (via the same page's `images` list) — this function never sees
  *        or returns URLs, only bytes in and indices out.
  * @param {string} [input.documentText]
- *        Legacy text-only mode, used only when `pages` isn't given.
+ *        Legacy text-only mode, used only when neither `rows` nor `pages` is given.
  * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, productType:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, quantity:number|null, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number}>}
  */
-async function extractBulkCatalogItems({ pages, documentText }) {
-  const segments = Array.isArray(pages) && pages.length > 0 ? splitIntoPageBatches(pages) : null;
+async function extractBulkCatalogItems({ headerLine, rows, pages, documentText }) {
+  const rowBatches = Array.isArray(rows) && rows.length > 0 ? splitIntoRowBatches(rows) : null;
+  const segments = !rowBatches && Array.isArray(pages) && pages.length > 0 ? splitIntoPageBatches(pages) : null;
 
   let items = [];
   let inputTokens = 0;
   let outputTokens = 0;
   let segmentCount = 0;
 
-  if (segments) {
+  if (rowBatches) {
+    for (const rowBatch of rowBatches) {
+      const result = await runRowBatchWithRetry(headerLine, rowBatch);
+      items = items.concat(result.items);
+      inputTokens += result.inputTokens;
+      outputTokens += result.outputTokens;
+      segmentCount++;
+    }
+  } else if (segments) {
     // Each page-batch is its own isolated API call with no memory of any
     // other batch — confirmed live: a brand named once on a section divider
     // page (sometimes only as a logo image, no brand text at all) can head
@@ -303,7 +418,7 @@ async function extractBulkCatalogItems({ pages, documentText }) {
   } else {
     const textSegments = splitIntoCharSegments(documentText || "");
     for (const segment of textSegments) {
-      const result = await runSegment(segment);
+      const result = await runTextSegmentWithRetry(segment);
       items = items.concat(result.items);
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
