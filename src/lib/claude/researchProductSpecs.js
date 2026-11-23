@@ -1,6 +1,6 @@
 // src/lib/claude/researchProductSpecs.js
 //
-// Bulk-import's research calls — duplicated from golfcare-backend's
+// Bulk-import's research call — duplicated from golfcare-backend's
 // src/services/supplierAgent/productResearch.js (can't require() across
 // repos). That version runs through backend's toolLoop.js; this repo has
 // no equivalent, so it's a single anthropic.messages.create call instead —
@@ -8,80 +8,64 @@
 // web_fetch are server tools Anthropic resolves WITHIN one response, no
 // client-side multi-turn loop needed.
 //
-// Pinned to Sonnet unconditionally, same reasoning as the backend version —
-// infrequent, needs reliable JSON output, not worth Haiku's risk.
+// ONE call per new product, covering everything it still needs:
+//   - specs text, always;
+//   - a single product photo, when it's a single-variant product the
+//     document gave no photo for (needsImage);
+//   - a photo per color/size, for a multi-variant product, but only for
+//     the variants the document didn't already supply a photo for
+//     (variantValues).
+// This used to be one call for specs plus one SEPARATE call per variant
+// missing a photo — a 5-color polo meant 6 calls, each re-searching and
+// re-reading the same product pages. On the real Bhiwandi run those
+// per-variant calls were the single biggest cost line (₹382 of ~₹1,090).
+// The pages a model reads for one color almost always show the others too,
+// so one call now asks for all of them at once.
 //
-// Two entry points, sharing this file's Anthropic client/cost math:
-//   - researchProductSpecs: runs ONCE per item, for the product's specs
-//     text. needsImage controls whether it ALSO searches for a photo —
-//     false whenever the document already supplied one (see
-//     pdfImageExtractor.js / extractBulkCatalogItems.js), which is the
-//     actual cost saving this split exists for: no point paying for
-//     web_search/web_fetch tool calls hunting an image we already have.
-//   - researchVariantImage: runs once PER VARIANT still missing a document
-//     image, but only when the item genuinely has more than one real
-//     variant (processItem.js keeps using researchProductSpecs's own
-//     imageUrl for the common single-variant case — unchanged, zero extra
-//     cost there). Image-only prompt, scoped to one specific color/size,
-//     so a 4-color belt with no document photos runs 4 of these, not one
-//     shared search reused across all 4 — confirmed/accepted trade-off.
+// Model, tool limits (max_uses / max_content_tokens) and pricing come from
+// modelConfig.js.
 
 const Anthropic = require("@anthropic-ai/sdk");
+const modelConfig = require("./modelConfig");
 
-const MODEL = "claude-sonnet-4-6";
-const SONNET_RATE = { inputPerMtok: 3, outputPerMtok: 15 };
-const USD_TO_INR = 95;
+const MODEL = modelConfig.RESEARCH_MODEL;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const TOOLS = [
-  { type: "web_search_20250305", name: "web_search", max_uses: 3 },
-  { type: "web_fetch_20250910", name: "web_fetch", max_uses: 3 },
-];
+const BASE_INSTRUCTIONS = `You are a focused product-research assistant for a golf retail catalog. Given a product name (and optionally a brand), use web_search, then web_fetch on the most relevant result (prefer the brand's own site or a major retailer), to find real information about that exact product. Keep it short: one good search and one or two page reads is normally enough.
 
-const SPECS_WITH_IMAGE_PROMPT = `You are a focused product-research assistant for a golf retail catalog. Given a product name (and optionally a brand), use web_search then web_fetch on the most relevant result to find real specs and a real product image.
+Respond with ONLY a JSON object, no other text, no markdown code fences.`;
 
-Respond with ONLY a JSON object, no other text, no markdown code fences:
+const SPECS_RULES = `- specs: 2-4 sentences of prose (materials, construction, features) — never restate the brand, SKU, or size, those aren't needed here. null if you couldn't find real information.
+- sourceNotes: one short sentence citing where this came from.`;
+
+const IMAGE_URL_RULE = `Every image URL must be a real, direct image URL you actually saw via web_fetch (an og:image meta tag or a product image src) — never a product PAGE url, never a guessed or constructed url. Use null whenever you can't confirm one.`;
+
+function buildPrompt({ needsImage, variantValues }) {
+  if (variantValues.length > 0) {
+    return `${BASE_INSTRUCTIONS}
+{"specs": "...", "imageUrl": "..." or null, "variantImages": {${variantValues.map((v) => JSON.stringify(v) + ': "..." or null').join(", ")}}, "sourceNotes": "..."}
+
+${SPECS_RULES}
+- imageUrl: any one good photo of this product (any color) — used only as the product's main photo, never attached to a specific variant. ${IMAGE_URL_RULE}
+- variantImages: for EACH listed color/size, a photo that clearly shows THAT variant. ${IMAGE_URL_RULE} Never reuse one variant's photo for a different one — if you can only confirm photos for some variants, give those and null for the rest. Keep exactly the variant names given as keys.`;
+  }
+  if (needsImage) {
+    return `${BASE_INSTRUCTIONS}
 {"specs": "...", "imageUrl": "..." or null, "sourceNotes": "..."}
 
-- specs: 2-4 sentences of prose (materials, construction, features, condition) — never restate the brand, SKU, or size, those aren't needed here.
-- imageUrl: a real, direct image URL you found via web_fetch (an og:image meta tag or a product image src) — never a product PAGE url, never a guessed or constructed url. Use null if you can't confirm a real one.
-- sourceNotes: one short sentence citing where this came from.
-
-If you can't find anything useful after searching, respond with {"specs": null, "imageUrl": null, "sourceNotes": "not found"}.`;
-
-// Used whenever every variant of this item already has a document-sourced
-// image — drops the image field/instruction entirely rather than asking
-// the model to search for (and potentially fetch extra pages hunting) a
-// photo that's just going to be discarded.
-const SPECS_ONLY_PROMPT = `You are a focused product-research assistant for a golf retail catalog. Given a product name (and optionally a brand), use web_search then web_fetch on the most relevant result to find real specs.
-
-Respond with ONLY a JSON object, no other text, no markdown code fences:
+${SPECS_RULES}
+- imageUrl: a photo of this product. ${IMAGE_URL_RULE}`;
+  }
+  return `${BASE_INSTRUCTIONS}
 {"specs": "...", "sourceNotes": "..."}
 
-- specs: 2-4 sentences of prose (materials, construction, features, condition) — never restate the brand, SKU, or size, those aren't needed here.
-- sourceNotes: one short sentence citing where this came from.
+${SPECS_RULES}`;
+}
 
-If you can't find anything useful after searching, respond with {"specs": null, "sourceNotes": "not found"}.`;
-
-const VARIANT_IMAGE_PROMPT = `You are a focused product-research assistant for a golf retail catalog. Given a product name, brand, and a specific color/size variant, use web_search then web_fetch to find a real photo specifically of THAT variant — not just any photo of the product.
-
-Respond with ONLY a JSON object, no other text, no markdown code fences:
-{"imageUrl": "..." or null, "sourceNotes": "..."}
-
-- imageUrl: a real, direct image URL you found via web_fetch (an og:image meta tag or a product image src) that clearly shows the requested color/size — never a product PAGE url, never a guessed or constructed url, never a different variant's photo passed off as this one. Use null if you can't confirm a real match for this specific variant.
-- sourceNotes: one short sentence citing where this came from.
-
-If you can't find a confirmable photo of this specific variant, respond with {"imageUrl": null, "sourceNotes": "not found"}.`;
-
-// With tool use (web_search/web_fetch), Claude frequently emits an interim
-// narration text block ("Let me fetch that page...") BEFORE its final JSON
-// answer — joining every text block with "\n" (the naive approach) then
-// has prose sitting in front of the JSON, which fails to parse even though
-// a real, valid JSON object is sitting right there in the same string.
-// Confirmed live: reproduced on 2 of 2 real researchVariantImage calls.
-// Pulling the substring between the first "{" and the last "}" sidesteps
-// this regardless of whether narration lands before, after, or around it.
+// With tool use, the model may emit narration text ("Let me fetch that
+// page...") before its final JSON answer — pull the substring between the
+// first "{" and the last "}" so that narration never breaks parsing.
 function parseJson(text, fallback) {
   const raw = (text || "").replace(/```(json)?/gi, "").trim();
   const start = raw.indexOf("{");
@@ -94,84 +78,70 @@ function parseJson(text, fallback) {
   }
 }
 
-function computeCost(usage) {
-  const usd =
-    (usage.inputTokens / 1_000_000) * SONNET_RATE.inputPerMtok +
-    (usage.outputTokens / 1_000_000) * SONNET_RATE.outputPerMtok;
-  return { usd, inr: usd * USD_TO_INR };
-}
+/**
+ * @param {object} input
+ * @param {string} input.title
+ * @param {string} [input.brand]
+ * @param {boolean} [input.needsImage] - single-variant product with no
+ *        document photo: also find one product photo.
+ * @param {string[]} [input.variantValues] - multi-variant product: the
+ *        colors/sizes still missing a document photo; one photo is looked
+ *        for per value, in this same call.
+ * @returns {Promise<{specs: string|null, imageUrl: string|null, variantImages: Record<string, string|null>, sourceNotes: string|null, model: string, usage: {inputTokens: number, outputTokens: number, webSearches: number}, cost: {usd: number, inr: number}}>}
+ */
+async function researchProductSpecs({ title, brand, needsImage = false, variantValues = [] }) {
+  const query = brand ? `${brand} ${title}` : title;
+  const wantsVariants = variantValues.length > 0;
+  const userContent = wantsVariants
+    ? `Product: ${query}\nVariants needing a photo: ${variantValues.join(", ")}`
+    : `Product: ${query}`;
 
-async function runResearchCall(systemPrompt, userContent, maxTokens) {
+  // Answer budget grows with the number of variant URLs requested.
+  const answerTokens = 512 + (wantsVariants ? 160 * variantValues.length : 0);
+
   const response = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: maxTokens,
-    system: systemPrompt,
-    tools: TOOLS,
+    max_tokens: modelConfig.maxTokensFor(MODEL, answerTokens),
+    system: buildPrompt({ needsImage: needsImage && !wantsVariants, variantValues }),
+    tools: modelConfig.researchTools(MODEL),
     messages: [{ role: "user", content: userContent }],
+    ...modelConfig.requestOptions(MODEL),
   });
+
   const text = response.content
     .filter((b) => b.type === "text")
     .map((b) => b.text)
     .join("\n");
-  const usage = {
-    inputTokens: response.usage?.input_tokens || 0,
-    outputTokens: response.usage?.output_tokens || 0,
-  };
-  return { text, usage };
-}
+  const parsed = parseJson(text, { specs: null, sourceNotes: "research_response_unparseable" });
+  const usage = modelConfig.usageFromResponse(response);
 
-/**
- * @param {object} input
- * @param {string} input.title
- * @param {string} [input.brand]
- * @param {boolean} [input.needsImage] - false when every variant already has
- *        a document-sourced image (skips the image field/search entirely,
- *        the actual cost saving); true (default) keeps the combined
- *        specs+image behavior, used as-is for a single-variant item with no
- *        document image.
- * @returns {Promise<{specs: string|null, imageUrl: string|null, sourceNotes: string|null, usage: {inputTokens: number, outputTokens: number}, cost: {usd: number, inr: number}}>}
- */
-async function researchProductSpecs({ title, brand, needsImage = true }) {
-  const query = brand ? `${brand} ${title}` : title;
-  const { text, usage } = await runResearchCall(
-    needsImage ? SPECS_WITH_IMAGE_PROMPT : SPECS_ONLY_PROMPT,
-    `Product: ${query}`,
-    512,
-  );
-  const parsed = parseJson(text, { specs: null, imageUrl: null, sourceNotes: "research_response_unparseable" });
+  // Only keep image URLs for variants we actually asked about, keyed
+  // exactly as given (the model is told to keep the keys, but a stray
+  // extra/renamed key must never land on the wrong variant).
+  const variantImages = {};
+  if (wantsVariants) {
+    const returned = parsed.variantImages && typeof parsed.variantImages === "object" ? parsed.variantImages : {};
+    for (const v of variantValues) {
+      const url = returned[v];
+      variantImages[v] = typeof url === "string" && url.startsWith("http") ? url : null;
+    }
+  }
+
+  // imageUrl: for a single-variant product, its photo; for a multi-variant
+  // one, a product-level main photo only (productImportDrain.js never
+  // assigns it to a variant — see fallbackImageUrl there).
+  const wantsAnyImage = needsImage || wantsVariants;
+  const imageUrl = wantsAnyImage && typeof parsed.imageUrl === "string" && parsed.imageUrl.startsWith("http") ? parsed.imageUrl : null;
 
   return {
     specs: parsed.specs || null,
-    imageUrl: needsImage ? parsed.imageUrl || null : null,
-    sourceNotes: parsed.sourceNotes || null,
+    imageUrl,
+    variantImages,
+    sourceNotes: parsed.sourceNotes || (response.stop_reason === "refusal" ? "declined" : null),
+    model: MODEL,
     usage,
-    cost: computeCost(usage),
+    cost: modelConfig.computeCost(MODEL, usage),
   };
 }
 
-/**
- * @param {object} input
- * @param {string} input.title
- * @param {string} [input.brand]
- * @param {string} input.variantValue - e.g. "Red", "XL" — the specific
- *        color/size this call must find a photo of.
- * @returns {Promise<{imageUrl: string|null, sourceNotes: string|null, usage: {inputTokens: number, outputTokens: number}, cost: {usd: number, inr: number}}>}
- */
-async function researchVariantImage({ title, brand, variantValue }) {
-  const query = brand ? `${brand} ${title}` : title;
-  const { text, usage } = await runResearchCall(
-    VARIANT_IMAGE_PROMPT,
-    `Product: ${query}\nVariant: ${variantValue}`,
-    384,
-  );
-  const parsed = parseJson(text, { imageUrl: null, sourceNotes: "research_response_unparseable" });
-
-  return {
-    imageUrl: parsed.imageUrl || null,
-    sourceNotes: parsed.sourceNotes || null,
-    usage,
-    cost: computeCost(usage),
-  };
-}
-
-module.exports = { researchProductSpecs, researchVariantImage };
+module.exports = { researchProductSpecs };

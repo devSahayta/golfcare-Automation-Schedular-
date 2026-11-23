@@ -34,10 +34,9 @@
 
 const Anthropic = require("@anthropic-ai/sdk");
 const { VOCABULARY } = require("../shopifyTaxonomy");
+const modelConfig = require("./modelConfig");
 
-const MODEL = "claude-sonnet-4-6";
-const SONNET_RATE = { inputPerMtok: 3, outputPerMtok: 15 };
-const USD_TO_INR = 95;
+const MODEL = modelConfig.EXTRACT_MODEL;
 const SEGMENT_CHARS = 6000; // legacy text-only path only
 const PAGES_PER_SEGMENT = Number(process.env.PRODUCT_IMPORT_PAGES_PER_SEGMENT) || 3;
 // Confirmed live, twice, that a fixed ROW COUNT per batch doesn't work: a
@@ -92,6 +91,7 @@ Rules:
 - Include every row/group that names a real product AND gives it an explicit price (MRP/price in INR). Skip anything with no price — section headers, brand intro text, "thank you" pages, decorative-only lines.
 - mrp: the number only, no currency symbols or commas. If a price looks obviously corrupted (e.g. "8GG0" where digits got OCR'd into letters), never guess the real number — instead drop that one variant (or the whole product if it's the only variant) rather than inventing a figure.
 - brand: the manufacturer/brand name, if identifiable from context (a section header naming the brand applies to the rows under it — including a brand shown only as a logo/wordmark image, with no brand text on the page at all, if you can read it in the image). You may also be given a "Carried-forward brand" note — the last brand established by an earlier page's own header/logo elsewhere in this same document, since a long brand section commonly doesn't repeat its name on every single page. Use it for rows on a page that shows no brand, header, or logo of its own. The moment a page in front of you shows a different or new brand's own header/logo/text, that overrides the carried-forward note — never let it override what's actually on the page.
+- Write brand as the brand's full official name, never a supplier's shorthand or code: e.g. "FJ" → "FootJoy", "TM" → "TaylorMade", "OJ" → "Oscar Jacobson", "Bag Boy" → "BagBoy". If you can't tell what an abbreviation stands for, copy it exactly as written rather than guessing.
 - Never include the same variant twice.
 - If you're shown a spreadsheet header line (the first line, naming each pipe-separated column), use it to know what each column actually means instead of guessing from position alone. A cell combining a code and a name in one value, e.g. "BB912730 (BB MOBILE DEVICE HOLDER)", splits into that variant's own sku ("BB912730") and the product's title ("BB MOBILE DEVICE HOLDER") — the parenthesized part is the human-readable name, the leading code is the sku, never keep them smashed together in title.
 
@@ -200,10 +200,15 @@ function buildPageBatchContent(pageBatch, carryForwardBrand) {
 }
 
 function parseSegmentResponse(text) {
-  const cleaned = (text || "")
-    .replace(/^```(json)?\s*/i, "")
-    .replace(/```\s*$/i, "")
-    .trim();
+  // Take only the JSON array itself: from the first "[" to the last "]".
+  // Confirmed live (model comparison, Nov 2026): Sonnet 4.6 sometimes
+  // writes a sentence ("Looking at these rows...") before the array, and
+  // the old strip-code-fences-then-JSON.parse approach threw the WHOLE
+  // batch away as unparseable — 20 priced rows became 0 items, silently.
+  const raw = (text || "").replace(/```(json)?/gi, "");
+  const start = raw.indexOf("[");
+  const end = raw.lastIndexOf("]");
+  const cleaned = start !== -1 && end > start ? raw.slice(start, end + 1) : raw.trim();
   let parsed;
   try {
     parsed = JSON.parse(cleaned);
@@ -234,19 +239,20 @@ function parseSegmentResponse(text) {
 }
 
 function computeCost(usage) {
-  const usd =
-    (usage.inputTokens / 1_000_000) * SONNET_RATE.inputPerMtok +
-    (usage.outputTokens / 1_000_000) * SONNET_RATE.outputPerMtok;
-  return { usd, inr: usd * USD_TO_INR };
+  return modelConfig.computeCost(MODEL, usage);
 }
 
 async function runSegment(content) {
   const response = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: MAX_OUTPUT_TOKENS,
+    max_tokens: modelConfig.maxTokensFor(MODEL, MAX_OUTPUT_TOKENS),
     system: SYSTEM_PROMPT,
     messages: [{ role: "user", content }],
+    ...modelConfig.requestOptions(MODEL),
   });
+  if (response.stop_reason === "refusal") {
+    console.warn("[extractBulkCatalogItems] model declined this segment (stop_reason: refusal) — treating as empty");
+  }
   const text = response.content
     .filter((b) => b.type === "text")
     .map((b) => b.text)
@@ -501,4 +507,4 @@ async function extractBulkCatalogItems({ headerLine, rows, pages, documentText, 
   return { items, usage, cost: computeCost(usage), segmentCount, totalUnitCount };
 }
 
-module.exports = { extractBulkCatalogItems, computeCost };
+module.exports = { extractBulkCatalogItems, computeCost, EXTRACT_MODEL: MODEL };

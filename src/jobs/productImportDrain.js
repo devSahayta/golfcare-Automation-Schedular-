@@ -29,8 +29,9 @@ const { prisma } = require("../lib/prisma");
 const { setAvailability } = require("../services/availabilityService");
 const { findExistingCatalogMatch, findPendingDraftMatch } = require("../lib/productCatalogMatch");
 const { broadTagFor } = require("../lib/shopifyTaxonomy");
-const { researchProductSpecs, researchVariantImage } = require("../lib/claude/researchProductSpecs");
-const { extractBulkCatalogItems, computeCost } = require("../lib/claude/extractBulkCatalogItems");
+const { researchProductSpecs } = require("../lib/claude/researchProductSpecs");
+const { extractBulkCatalogItems, computeCost, EXTRACT_MODEL } = require("../lib/claude/extractBulkCatalogItems");
+const { normalizeBrand } = require("../lib/brandNormalizer");
 const { extractPdfPagesWithImages, isPdf } = require("../lib/pdfImageExtractor");
 const { extractXlsxRows, isXlsx } = require("../lib/xlsxRowExtractor");
 const { extractDocxFullText, isDocx } = require("../lib/docxTextExtractor");
@@ -182,7 +183,7 @@ async function persistExtractedUnit(batch, rawItems, globalIndexToUrl, { inputTo
           conversationId: batch.conversationId,
           productImportBatchId: batch.id,
           agentName: "SUPPLIER_BULK_IMPORT",
-          model: "claude-sonnet-4-6",
+          model: EXTRACT_MODEL,
           inputTokens,
           outputTokens,
           costUsd: cost.usd,
@@ -219,7 +220,11 @@ async function persistExtractedUnit(batch, rawItems, globalIndexToUrl, { inputTo
       // in that case (see start_bulk_product_import, backend repo) — only
       // used when extraction found nothing on the page itself, never
       // overriding a brand the document actually states.
-      const brand = i.brand || batch.defaultBrand || null;
+      //
+      // normalizeBrand maps the supplier's own shorthand/spelling ("FJ",
+      // "BAGBOY", "Callaway Golf") onto the exact name on their allowed
+      // list before the exact-match check below — see brandNormalizer.js.
+      const brand = normalizeBrand(i.brand || batch.defaultBrand, supplierBrands);
       const brandAllowed = brand && supplierBrands.some((b) => b.toLowerCase() === brand.toLowerCase());
       const rate = brandAllowed ? resolveRate(batch.rateRules, { ...i, brand }) : null;
 
@@ -492,33 +497,42 @@ async function processItem(item, batch) {
       return { kind: "already_drafted" };
     }
 
-    // Genuinely new. Specs research runs once per item regardless (a
-    // document that already gave a usable description would skip this,
-    // but bulk-imported rows never carry one — just title/sku/mrp). Only
-    // asks it to ALSO search for an image when there's exactly one variant
-    // and the document didn't already supply a photo for it — for any
-    // item with real multiple variants, a shared/guessed image at the
-    // product level isn't wanted at all; each variant gets its own
-    // resolution below instead (document photo, or its own dedicated
-    // researchVariantImage call), never a single image reused across
-    // colors/sizes.
-    const needsSharedImage = variants.length === 1 && !variants[0].documentImageUrl;
-    const research = await researchProductSpecs({ title: item.title, brand: item.brand, needsImage: needsSharedImage });
+    // Genuinely new: ONE research call covers everything this product
+    // still needs (researchProductSpecs.js) —
+    //   - specs, always (bulk-imported rows never carry a description);
+    //   - one product photo, for a single-variant product the document
+    //     gave no photo for;
+    //   - one photo per color/size, for a multi-variant product, only for
+    //     the variants with no document photo. Each variant still gets its
+    //     OWN photo, never one image reused across colors — just found in
+    //     the same call instead of one separate web search per color.
+    const isMultiVariant = variants.length > 1;
+    const needsSharedImage = !isMultiVariant && !variants[0].documentImageUrl;
+    const variantValuesNeedingImage = isMultiVariant
+      ? variants.filter((v) => !v.documentImageUrl && v.value).map((v) => v.value)
+      : [];
+    const research = await researchProductSpecs({
+      title: item.title,
+      brand: item.brand,
+      needsImage: needsSharedImage,
+      variantValues: variantValuesNeedingImage,
+    });
 
     if (batch.conversationId) {
+      const foundAnyImage = research.imageUrl || Object.values(research.variantImages).some(Boolean);
       try {
         await prisma.agentUsage.create({
           data: {
             conversationId: batch.conversationId,
             productImportBatchId: batch.id,
             agentName: "SUPPLIER_BULK_IMPORT",
-            model: "claude-sonnet-4-6",
+            model: research.model,
             inputTokens: research.usage.inputTokens,
             outputTokens: research.usage.outputTokens,
             costUsd: research.cost.usd,
             costInr: research.cost.inr,
             toolCallCount: 1,
-            outcome: research.specs || research.imageUrl ? "researched" : "no_result",
+            outcome: research.specs || foundAnyImage ? "researched" : "no_result",
           },
         });
       } catch (err) {
@@ -527,41 +541,15 @@ async function processItem(item, batch) {
     }
 
     // Resolve each variant's own final image: the document's own photo if
-    // it has one (free — already extracted/uploaded), else the shared
-    // research result for the single-variant case, else its own dedicated
-    // per-variant web search — confirmed/accepted trade-off: a multi-color
-    // product with no document photos runs one researchVariantImage call
-    // PER missing color, not one shared search reused across all of them.
+    // it has one (free — already extracted/uploaded), else what research
+    // found for that exact variant (or the product photo, single-variant).
     for (const v of variants) {
       if (v.documentImageUrl) {
         v.resolvedImageUrl = v.documentImageUrl;
-        continue;
-      }
-      if (variants.length === 1) {
+      } else if (!isMultiVariant) {
         v.resolvedImageUrl = research.imageUrl || null;
-        continue;
-      }
-      const imgResearch = await researchVariantImage({ title: item.title, brand: item.brand, variantValue: v.value });
-      v.resolvedImageUrl = imgResearch.imageUrl || null;
-      if (batch.conversationId) {
-        try {
-          await prisma.agentUsage.create({
-            data: {
-              conversationId: batch.conversationId,
-              productImportBatchId: batch.id,
-              agentName: "SUPPLIER_BULK_IMPORT",
-              model: "claude-sonnet-4-6",
-              inputTokens: imgResearch.usage.inputTokens,
-              outputTokens: imgResearch.usage.outputTokens,
-              costUsd: imgResearch.cost.usd,
-              costInr: imgResearch.cost.inr,
-              toolCallCount: 1,
-              outcome: imgResearch.imageUrl ? "variant_image_researched" : "no_result",
-            },
-          });
-        } catch (err) {
-          console.error(`[job] productImportDrain: AgentUsage log failed for item ${item.id} variant ${v.value}:`, err.message);
-        }
+      } else {
+        v.resolvedImageUrl = (v.value && research.variantImages[v.value]) || null;
       }
     }
 
