@@ -138,6 +138,24 @@ async function extractPagesWithUploadedImages(batch, pdfBuffer) {
   return { pagesForExtraction, globalIndexToUrl };
 }
 
+// A variant whose SKU exactly matches a supplier correction gets the
+// supplier's price, whatever the extractor read off the document. Only
+// exact SKU matches — a correction given by product name is left to the
+// extractor's own prompt (buildCorrectionsNote), since name matching here
+// could hit the wrong product.
+function applyPriceCorrections(variants, corrections) {
+  const bySku = new Map(
+    (Array.isArray(corrections) ? corrections : [])
+      .filter((c) => c && c.skuOrName && Number(c.mrp) > 0)
+      .map((c) => [String(c.skuOrName).trim().toLowerCase(), Number(c.mrp)]),
+  );
+  if (bySku.size === 0) return variants;
+  return variants.map((v) => {
+    const mrp = v.sku ? bySku.get(String(v.sku).trim().toLowerCase()) : undefined;
+    return mrp ? { ...v, mrp } : v;
+  });
+}
+
 // Turns ONE unit-batch's (a row-batch, page-batch, or text-segment) raw
 // extracted items into real ProductImportItem rows and advances the
 // batch's running counters — called incrementally, once per unit-batch, as
@@ -206,6 +224,7 @@ async function persistExtractedUnit(batch, rawItems, globalIndexToUrl, { inputTo
     .filter((i) => Array.isArray(i.variants) && i.variants.length > 0)
     .slice(0, remainingBudget)
     .map((i) => {
+      i.variants = applyPriceCorrections(i.variants, batch.supplierCorrections);
       // Brand authorization takes priority over rate-resolution — no point
       // resolving a margin/GST rate for an item that's going to be held
       // back regardless. A supplier should only ever draft brands on their
@@ -316,6 +335,12 @@ async function extractPendingBatch() {
     });
   };
 
+  // Supplier price corrections from chat (start_bulk_product_import,
+  // backend repo) — handed to the extractor so a product with an
+  // unreadable printed price isn't dropped, and re-applied by SKU in
+  // persistExtractedUnit as a deterministic backstop.
+  const corrections = Array.isArray(batch.supplierCorrections) ? batch.supplierCorrections : [];
+
   try {
     let rawResult;
 
@@ -336,17 +361,17 @@ async function extractPendingBatch() {
       if (isPdf(sourceBuffer)) {
         const prepared = await extractPagesWithUploadedImages(batch, sourceBuffer);
         globalIndexToUrl = prepared.globalIndexToUrl;
-        rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction, startUnitIndex, onUnitComplete });
+        rawResult = await extractBulkCatalogItems({ pages: prepared.pagesForExtraction, corrections, startUnitIndex, onUnitComplete });
       } else if (isDocx(sourceBuffer)) {
         // Checked before isXlsx — .xlsx/.docx/.pptx all share the same
         // zip signature, and isDocx's own word/document.xml check is the
         // specific, unambiguous one; isXlsx only confirms the ABSENCE of
         // that (plus pptx's own marker), so it must run second.
         const fullText = await extractDocxFullText(sourceBuffer);
-        rawResult = await extractBulkCatalogItems({ documentText: fullText, startUnitIndex, onUnitComplete });
+        rawResult = await extractBulkCatalogItems({ documentText: fullText, corrections, startUnitIndex, onUnitComplete });
       } else if (isXlsx(sourceBuffer)) {
         const { headerLine, rows } = await extractXlsxRows(sourceBuffer);
-        rawResult = await extractBulkCatalogItems({ headerLine, rows, startUnitIndex, onUnitComplete });
+        rawResult = await extractBulkCatalogItems({ headerLine, rows, corrections, startUnitIndex, onUnitComplete });
       } else {
         // No full-fidelity reader for this format (e.g. a .pptx catalog)
         // — fail loudly into the same extractionError path below rather
@@ -354,7 +379,7 @@ async function extractPendingBatch() {
         throw new Error("Attachment is not a PDF, spreadsheet, or Word document this pipeline can read in full.");
       }
     } else {
-      rawResult = await extractBulkCatalogItems({ documentText: batch.rawDocumentText || "", startUnitIndex, onUnitComplete });
+      rawResult = await extractBulkCatalogItems({ documentText: batch.rawDocumentText || "", corrections, startUnitIndex, onUnitComplete });
     }
 
     // Every remaining unit has now been extracted AND persisted
@@ -442,6 +467,7 @@ async function processItem(item, batch) {
         title: item.title,
         sku: v.sku,
         variantOptions: item.variantOptionName && v.value ? [{ name: item.variantOptionName, value: v.value }] : [],
+        brand: item.brand,
       });
       if (catalogMatch?.variant) break;
     }

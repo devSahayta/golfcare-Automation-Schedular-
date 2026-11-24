@@ -36,7 +36,81 @@ function tokenize(s) {
  * @param {{name: string, value: string}[]} [input.variantOptions]
  * @returns {Promise<{product: object, variant: object} | null>}
  */
-async function findExistingCatalogMatch({ title, sku, variantOptions }) {
+// Both sides have a SKU and they differ → a different item, whatever the
+// title says. Confirmed live: Adidas KBG277 (Ultimate365 Tapered Golf
+// Pants, Wonder Sage) title-matched the store's existing single-variant
+// "Ultimate365 Tapered Golf Pants" (Hemp, IU2835) — a bulk import would
+// have marked HEMP in stock and linked the supplier to it, and the Wonder
+// Sage pants would never have been added. A different colour/article is
+// not "already in the store". Missing SKU on either side → no opinion.
+//
+// Golf Care's own store SKUs ("WC-16323" — 4,878 of ~4,900 live variants)
+// are internal codes, never a maker's article number, so a supplier's code
+// can't be compared with them: treated as "no SKU", or nearly every
+// legitimate title match would flip to "new" (checked against past bulk
+// imports: 19 of 20 linked items would have).
+const INTERNAL_STORE_SKU_RE = /^WC-\d+$/i;
+function skuConflicts(sku, otherSku) {
+  if (!sku || !otherSku) return false;
+  if (INTERNAL_STORE_SKU_RE.test(String(otherSku).trim())) return false;
+  return String(sku).trim().toLowerCase() !== String(otherSku).trim().toLowerCase();
+}
+
+// Model-word rule. Title overlap alone (>= 60% of the supplier's words)
+// let look-alikes through, because the shared words were generic:
+// "Titleist AVX Dozen" matched "Titleist Pro V1 Golf Balls (Dozen)",
+// "GS Solid Lisle Black Shirt" matched "Jungle Leaves Lisle Golf Polo -
+// Black", "Pro SL Carbon BOA" matched "Pro SLX Boa XW Spikeless Golf
+// Shoes". What tells products apart is the model word (avx, solid, carbon),
+// so every MODEL WORD in the incoming title must also be in the store
+// title. A model word is one that appears in only a few store titles
+// (1..MODEL_WORD_MAX_TITLES) — measured from the live catalog, not a
+// hand-kept list — and isn't:
+//   - a brand: store titles mostly leave the brand out ("adidas" is in 7
+//     of 1,847 titles), so brand words come from Product.vendor instead;
+//   - a packaging/marketing word that's rare in titles but says nothing
+//     about which product it is (GENERIC_WORDS);
+//   - unknown to the store (0 titles): likely supplier shorthand ("GS"),
+//     which no store title could contain anyway.
+const MODEL_WORD_MAX_TITLES = 20;
+const GENERIC_WORDS = new Set([
+  "dozen", "pack", "pcs", "pc", "piece", "pieces", "box", "new", "edition",
+  "mens", "womens", "ladies", "unisex", "junior", "kids", "youth",
+  "2022", "2023", "2024", "2025", "2026", "2027",
+]);
+const STATS_TTL_MS = 10 * 60 * 1000;
+let titleStatsCache = null;
+
+async function getTitleStats() {
+  if (titleStatsCache && Date.now() - titleStatsCache.at < STATS_TTL_MS) return titleStatsCache;
+  const products = await prisma.product.findMany({
+    where: { status: "active" },
+    select: { title: true, vendor: true },
+  });
+  const titleCount = new Map();
+  const brandWords = new Set();
+  for (const p of products) {
+    for (const t of new Set(tokenize(p.title))) titleCount.set(t, (titleCount.get(t) || 0) + 1);
+    for (const t of tokenize(p.vendor)) brandWords.add(t);
+  }
+  titleStatsCache = { at: Date.now(), titleCount, brandWords };
+  return titleStatsCache;
+}
+
+function modelWords(titleTokens, stats, extraBrandWords) {
+  return titleTokens.filter((t) => {
+    const n = stats.titleCount.get(t) || 0;
+    return (
+      n >= 1 &&
+      n <= MODEL_WORD_MAX_TITLES &&
+      !GENERIC_WORDS.has(t) &&
+      !stats.brandWords.has(t) &&
+      !extraBrandWords.has(t)
+    );
+  });
+}
+
+async function findExistingCatalogMatch({ title, sku, variantOptions, brand }) {
   if (sku) {
     const bySku = await prisma.variant.findFirst({
       where: { sku: { equals: sku, mode: "insensitive" }, Product: { status: "active" } },
@@ -58,13 +132,16 @@ async function findExistingCatalogMatch({ title, sku, variantOptions }) {
   });
   if (candidates.length === 0) return null;
 
+  const stats = await getTitleStats();
+  const required = modelWords(titleTokens, stats, new Set(tokenize(brand)));
   const scored = candidates
     .map((p) => {
       const candidateTokens = new Set(tokenize(p.title));
       const overlap = titleTokens.filter((t) => candidateTokens.has(t)).length;
-      return { product: p, score: overlap / titleTokens.length };
+      return { product: p, score: overlap / titleTokens.length, candidateTokens };
     })
     .filter((s) => s.score >= 0.6)
+    .filter((s) => required.every((t) => s.candidateTokens.has(t)))
     .sort((a, b) => b.score - a.score);
 
   if (scored.length === 0) return null;
@@ -72,7 +149,10 @@ async function findExistingCatalogMatch({ title, sku, variantOptions }) {
 
   const product = scored[0].product;
   if (product.Variant.length === 0) return null;
-  if (product.Variant.length === 1) return { product, variant: product.Variant[0] };
+  if (product.Variant.length === 1) {
+    if (skuConflicts(sku, product.Variant[0].sku)) return null;
+    return { product, variant: product.Variant[0] };
+  }
 
   const optionTokens = (variantOptions || []).flatMap((o) => tokenize(o.value));
   if (optionTokens.length === 0) return null;
@@ -86,6 +166,7 @@ async function findExistingCatalogMatch({ title, sku, variantOptions }) {
   if (variantScored[0].score < 0.5) return null;
   if (variantScored.length > 1 && variantScored[1].score >= variantScored[0].score) return null;
 
+  if (skuConflicts(sku, variantScored[0].variant.sku)) return null;
   return { product, variant: variantScored[0].variant };
 }
 
@@ -130,7 +211,15 @@ async function findPendingDraftMatch({ title, sku }) {
   const titleTokens = tokenize(title);
   if (titleTokens.length === 0) return null;
 
+  // Same different-SKU rule as findExistingCatalogMatch: a pending draft
+  // for another colour/article of the same title isn't this item.
+  const draftSkus = (p) =>
+    [p.sku, ...(Array.isArray(p.variants) ? p.variants.map((v) => v.sku) : [])].filter(Boolean);
   const scored = drafts
+    .filter((d) => {
+      const skus = draftSkus(d.rawPayload || {});
+      return !sku || skus.length === 0 || !skus.every((x) => skuConflicts(sku, x));
+    })
     .map((d) => {
       const draftTitle = d.rawPayload?.title || "";
       const draftTokens = new Set(tokenize(draftTitle));

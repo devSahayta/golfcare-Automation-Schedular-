@@ -242,11 +242,27 @@ function computeCost(usage) {
   return modelConfig.computeCost(MODEL, usage);
 }
 
-async function runSegment(content) {
+// Price corrections the supplier gave in chat (ProductImportBatch.
+// supplierCorrections), e.g. "KBG277 is 8800" for a price the document
+// printed as "8GG0". Without this the extractor follows its own rule and
+// drops a product whose printed price is unreadable — confirmed live, the
+// KBG277 pants never made it out of an Adidas list even though the
+// supplier had told the agent the real price. Added as a second system
+// block so the base prompt stays identical for every call.
+function buildCorrectionsNote(corrections) {
+  const list = (Array.isArray(corrections) ? corrections : []).filter((c) => c && c.skuOrName && c.mrp != null);
+  if (list.length === 0) return null;
+  return `The supplier has corrected these prices in chat. They override what the document shows, including a price that is unreadable or corrupted there (so do NOT drop these products for an unreadable price — use the corrected one):
+${list.map((c) => `- ${c.skuOrName}: MRP ${c.mrp}`).join("\n")}`;
+}
+
+async function runSegment(content, correctionsNote) {
   const response = await anthropic.messages.create({
     model: MODEL,
     max_tokens: modelConfig.maxTokensFor(MODEL, MAX_OUTPUT_TOKENS),
-    system: SYSTEM_PROMPT,
+    system: correctionsNote
+      ? [{ type: "text", text: SYSTEM_PROMPT }, { type: "text", text: correctionsNote }]
+      : SYSTEM_PROMPT,
     messages: [{ role: "user", content }],
     ...modelConfig.requestOptions(MODEL),
   });
@@ -279,8 +295,8 @@ async function runSegment(content) {
 // per call. Bottoms out at single pages; a single page that still
 // truncates is logged and returned as-is (best-effort partial parse) since
 // there's nothing smaller left to retry with.
-async function runPageBatchWithRetry(pageBatch, carryForwardBrand) {
-  const result = await runSegment(buildPageBatchContent(pageBatch, carryForwardBrand));
+async function runPageBatchWithRetry(pageBatch, carryForwardBrand, correctionsNote) {
+  const result = await runSegment(buildPageBatchContent(pageBatch, carryForwardBrand), correctionsNote);
   if (!result.truncated || pageBatch.length === 1) {
     if (result.truncated) {
       console.warn(
@@ -301,7 +317,7 @@ async function runPageBatchWithRetry(pageBatch, carryForwardBrand) {
   let outputTokens = result.outputTokens;
   let brand = carryForwardBrand;
   for (const half of halves) {
-    const sub = await runPageBatchWithRetry(half, brand);
+    const sub = await runPageBatchWithRetry(half, brand, correctionsNote);
     items = items.concat(sub.items);
     inputTokens += sub.inputTokens;
     outputTokens += sub.outputTokens;
@@ -314,8 +330,8 @@ async function runPageBatchWithRetry(pageBatch, carryForwardBrand) {
 // Same truncation-halving shape as runPageBatchWithRetry, for a row-batch
 // instead of a page-batch — no carry-forward-brand to thread through (see
 // buildRowBatchContent's own comment for why).
-async function runRowBatchWithRetry(headerLine, rowBatch) {
-  const result = await runSegment(buildRowBatchContent(headerLine, rowBatch));
+async function runRowBatchWithRetry(headerLine, rowBatch, correctionsNote) {
+  const result = await runSegment(buildRowBatchContent(headerLine, rowBatch), correctionsNote);
   if (!result.truncated || rowBatch.length <= MIN_ROWS_PER_RETRY) {
     if (result.truncated) {
       console.warn(
@@ -335,7 +351,7 @@ async function runRowBatchWithRetry(headerLine, rowBatch) {
   let inputTokens = result.inputTokens;
   let outputTokens = result.outputTokens;
   for (const half of halves) {
-    const sub = await runRowBatchWithRetry(headerLine, half);
+    const sub = await runRowBatchWithRetry(headerLine, half, correctionsNote);
     items = items.concat(sub.items);
     inputTokens += sub.inputTokens;
     outputTokens += sub.outputTokens;
@@ -352,8 +368,8 @@ async function runRowBatchWithRetry(headerLine, rowBatch) {
 // (falls back to a hard character split if the segment has no newline
 // near the middle — same fallback splitIntoCharSegments itself already
 // uses).
-async function runTextSegmentWithRetry(segmentText) {
-  const result = await runSegment(segmentText);
+async function runTextSegmentWithRetry(segmentText, correctionsNote) {
+  const result = await runSegment(segmentText, correctionsNote);
   if (!result.truncated || segmentText.length < 200) {
     if (result.truncated) {
       console.warn(
@@ -375,7 +391,7 @@ async function runTextSegmentWithRetry(segmentText) {
   let inputTokens = result.inputTokens;
   let outputTokens = result.outputTokens;
   for (const half of halves) {
-    const sub = await runTextSegmentWithRetry(half);
+    const sub = await runTextSegmentWithRetry(half, correctionsNote);
     items = items.concat(sub.items);
     inputTokens += sub.inputTokens;
     outputTokens += sub.outputTokens;
@@ -398,6 +414,8 @@ async function runTextSegmentWithRetry(segmentText) {
  *        or returns URLs, only bytes in and indices out.
  * @param {string} [input.documentText]
  *        Legacy text-only mode, used only when neither `rows` nor `pages` is given.
+ * @param {{skuOrName: string, mrp: number}[]} [input.corrections]
+ *        Supplier price corrections from chat — see buildCorrectionsNote.
  * @param {number} [input.startUnitIndex]
  *        Resume point — skips this many of the source's own units (rows for
  *        `rows` mode, pages for `pages` mode, text-segments for
@@ -416,7 +434,8 @@ async function runTextSegmentWithRetry(segmentText) {
  *        already ran the callback successfully stays persisted regardless.
  * @returns {Promise<{items: {title:string, brand:string|null, category:string|null, productType:string|null, variantOptionName:string|null, variants:{value:string|null, sku:string|null, mrp:number, quantity:number|null, documentImageIndex:number|null}[]}[], usage: {inputTokens:number, outputTokens:number}, cost: {usd:number, inr:number}, segmentCount: number, totalUnitCount: number}>}
  */
-async function extractBulkCatalogItems({ headerLine, rows, pages, documentText, startUnitIndex = 0, onUnitComplete }) {
+async function extractBulkCatalogItems({ headerLine, rows, pages, documentText, corrections, startUnitIndex = 0, onUnitComplete }) {
+  const correctionsNote = buildCorrectionsNote(corrections);
   const allRows = Array.isArray(rows) && rows.length > 0 ? rows : null;
   const allPages = !allRows && Array.isArray(pages) && pages.length > 0 ? pages : null;
   const allTextSegments = !allRows && !allPages ? splitIntoCharSegments(documentText || "") : null;
@@ -433,7 +452,7 @@ async function extractBulkCatalogItems({ headerLine, rows, pages, documentText, 
 
   if (rowBatches) {
     for (const rowBatch of rowBatches) {
-      const result = await runRowBatchWithRetry(headerLine, rowBatch);
+      const result = await runRowBatchWithRetry(headerLine, rowBatch, correctionsNote);
       items = items.concat(result.items);
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
@@ -459,7 +478,7 @@ async function extractBulkCatalogItems({ headerLine, rows, pages, documentText, 
     // pages.
     let carryForwardBrand = null;
     for (const pageBatch of segments) {
-      const result = await runPageBatchWithRetry(pageBatch, carryForwardBrand);
+      const result = await runPageBatchWithRetry(pageBatch, carryForwardBrand, correctionsNote);
       items = items.concat(result.items);
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
@@ -489,7 +508,7 @@ async function extractBulkCatalogItems({ headerLine, rows, pages, documentText, 
     }
   } else {
     for (const segment of remainingTextSegments) {
-      const result = await runTextSegmentWithRetry(segment);
+      const result = await runTextSegmentWithRetry(segment, correctionsNote);
       items = items.concat(result.items);
       inputTokens += result.inputTokens;
       outputTokens += result.outputTokens;
