@@ -86,7 +86,9 @@ async function ensureBucket() {
  * @param {string} fileName  - used to build a unique object path (sanitized)
  * @returns {Promise<string>} public HTTPS URL
  */
-async function uploadDocumentImage(buffer, fileName) {
+// contentType: defaults to JPEG (document photos are always JPEG);
+// rehostImage.js passes the real type for PNG/WebP web images.
+async function uploadDocumentImage(buffer, fileName, contentType = "image/jpeg") {
   await ensureBucket();
   const supabase = getClient();
 
@@ -95,7 +97,7 @@ async function uploadDocumentImage(buffer, fileName) {
 
   const { error: uploadErr } = await supabase.storage
     .from(BUCKET)
-    .upload(path, buffer, { contentType: "image/jpeg", upsert: false });
+    .upload(path, buffer, { contentType, upsert: false });
 
   if (uploadErr) {
     throw new Error(`Supabase Storage upload failed: ${uploadErr.message}`);

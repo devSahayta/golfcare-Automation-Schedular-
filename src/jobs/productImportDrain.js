@@ -36,6 +36,7 @@ const { extractPdfPagesWithImages, isPdf } = require("../lib/pdfImageExtractor")
 const { extractXlsxRows, isXlsx } = require("../lib/xlsxRowExtractor");
 const { extractDocxFullText, isDocx } = require("../lib/docxTextExtractor");
 const { uploadDocumentImage } = require("../lib/supabaseStorage");
+const { rehostImage } = require("../lib/rehostImage");
 const { createDraftProduct, addVariantImage } = require("../lib/shopify");
 const { updateInventoryItemCost, setInitialStockQuantity } = require("../lib/shopifyInventory");
 const { computeCostPrice } = require("../lib/pricingCalculator");
@@ -564,6 +565,23 @@ async function processItem(item, batch) {
       } catch (err) {
         console.error(`[job] productImportDrain: AgentUsage log failed for item ${item.id}:`, err.message);
       }
+    }
+
+    // Copy every image research found into our own storage before Shopify
+    // sees it — Shopify can't download from sites that block non-browser
+    // requests (footjoy.com, carlsgolfland.com…), and a dead or non-image
+    // URL is dropped here instead of being written onto the draft. See
+    // rehostImage.js. One copy per distinct URL.
+    const rehosted = new Map();
+    const rehost = async (url, hint) => {
+      if (!url) return null;
+      if (!rehosted.has(url)) rehosted.set(url, await rehostImage(url, hint));
+      return rehosted.get(url);
+    };
+    const itemHint = `import-${item.id}`;
+    research.imageUrl = await rehost(research.imageUrl, `${itemHint}-main`);
+    for (const [value, url] of Object.entries(research.variantImages || {})) {
+      research.variantImages[value] = await rehost(url, `${itemHint}-${value}`);
     }
 
     // Resolve each variant's own final image: the document's own photo if
